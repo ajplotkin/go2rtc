@@ -4,7 +4,7 @@ You have Google Nest cameras. You want them in Apple HomeKit. And you want to ac
 
 This is harder than it should be. Google does not offer Nest cameras through HomeKit natively, and when they migrated Nest devices to the Google Home app, they removed the API that provided still images. No integration — commercial or open-source — can request a snapshot from these cameras anymore. The only way to get a real picture is to grab a frame from a live video stream.
 
-This guide walks through the full setup from scratch: getting API access to your Nest cameras, bridging them into HomeKit, and then solving the snapshot problem by keeping a warm stream and serving frames from it. By the end you'll have real camera images on your HomeKit tiles, refreshed every 20 seconds, with live stream startup in about 2 seconds.
+This guide walks through the full setup from scratch: getting API access to your Nest cameras, bridging them into HomeKit, and then solving the snapshot problem by keeping a warm stream and serving frames from it. By the end you'll have real camera images on your HomeKit tiles, refreshed every 10 seconds, with live stream startup in about 2 seconds.
 
 **Everything here is open source and runs on a Raspberry Pi.**
 
@@ -18,7 +18,7 @@ There are four layers. Each builds on the last:
 
 3. **[go2rtc](https://github.com/AlexxIT/go2rtc)** (patched) — go2rtc (by [@AlexxIT](https://github.com/AlexxIT)) is a streaming tool that can connect to Nest cameras via WebRTC, keep the connection alive, re-serve the stream over RTSP, and produce JPEG snapshots on demand. This is the engine that makes real tile images possible. (A one-line patch is needed on many home networks — explained below.)
 
-4. **Snapshot warmer + plugin patches** — A small script that pulls a JPEG from each warm stream every 20 seconds, plus a patch to the Homebridge plugin that serves those images instead of the placeholder. This is the glue that connects go2rtc's capabilities to your HomeKit tiles.
+4. **Snapshot warmer + plugin patches** — A small script that pulls a JPEG from each warm stream every 10 seconds (and immediately on motion/doorbell events), plus a patch to the Homebridge plugin that serves those images instead of the placeholder. This is the glue that connects go2rtc's capabilities to your HomeKit tiles.
 
 ## Already have Homebridge + homebridge-google-nest-sdm working?
 
@@ -293,11 +293,11 @@ You now have go2rtc serving JPEG snapshots via HTTP. The obvious approach is to 
 - HomeKit polls tiles roughly every 10 seconds. go2rtc's JPEG cache lasts 30 seconds. Every third poll is a **cache miss**, which spins up ffmpeg and takes ~1.5 seconds — triggering Homebridge's "snapshot handler is slow to respond" warning.
 - Worse: **two concurrent cache misses return HTTP 500**, and the plugin's error path falls back to the placeholder logo. The logo flashes back intermittently.
 
-The solution is a warmer script that pre-fetches a JPEG every 20 seconds and writes it to a file. The plugin reads the file (~1ms, never races, never 500s).
+The solution is a warmer script that pre-fetches a JPEG every 10 seconds and writes it to a file. The plugin reads the file (~1ms, never races, never 500s). On motion or doorbell events, the plugin signals the warmer to grab a fresh frame immediately — so the tile shows *who's there*, not a 10-second-old empty porch.
 
 ### SD card wear
 
-**If your system runs on an SD card** (most Raspberry Pis), put the snapshots in tmpfs (RAM). Writing ~100KB JPEGs every 20 seconds per camera is ~780 MB/day of flash writes for data that's pure cache — the warmer rebuilds it in 20 seconds after a reboot. tmpfs costs about 200KB of RAM.
+**If your system runs on an SD card** (most Raspberry Pis), put the snapshots in tmpfs (RAM). Writing ~100KB JPEGs every 10 seconds per camera is ~1.5 GB/day of flash writes for data that's pure cache — the warmer rebuilds it in seconds after a reboot. tmpfs costs about 200KB of RAM.
 
 ```bash
 echo 'd /run/nest-snaps 0755 1000 1000 -' | sudo tee /etc/tmpfiles.d/nest-snaps.conf
@@ -308,14 +308,19 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/nest-snaps.conf
 
 The warmer auto-discovers streams from go2rtc (no hardcoded camera list) and only polls streams that have active media — cameras that are off are skipped, avoiding wasted SDM quota. Stale files are pruned after 2 minutes so an off camera shows the honest placeholder rather than a frozen frame.
 
+It also watches for an **event trigger**: when the plugin receives a motion or doorbell event, it touches a signal file, and the warmer grabs a fresh frame within 1 second instead of waiting for the next cycle.
+
 Save as `~/scripts/go2rtc-snapshot-warmer.sh`:
 
 ```bash
 #!/bin/bash
-DIR=/run/nest-snaps    # tmpfs — change for non-SD-card systems
+# Baseline: refresh every 10s (HomeKit polls ~10s, go2rtc cache 30s -> always a hit).
+# Event-triggered: touch /run/nest-snaps/.refresh for an immediate cycle.
+DIR=/run/nest-snaps
 API=http://127.0.0.1:1985
+INTERVAL=10
 mkdir -p "$DIR"
-while true; do
+refresh_all() {
   WARM=$(curl -s -m 10 "$API/api/streams" | python3 -c '
 import sys, json
 try:
@@ -337,7 +342,17 @@ for name, s in d.items():
     rm -f "$DIR/.$s.tmp" 2>/dev/null || true
   done
   find "$DIR" -name '*.jpg' -mmin +2 -delete 2>/dev/null || true
-  sleep 20
+}
+while true; do
+  refresh_all
+  for i in $(seq 1 $INTERVAL); do
+    if [ -f "$DIR/.refresh" ]; then
+      rm -f "$DIR/.refresh"
+      refresh_all
+      break
+    fi
+    sleep 1
+  done
 done
 ```
 
@@ -376,7 +391,9 @@ docker run -d --name homebridge \
 
 Patch two files in `node_modules/homebridge-google-nest-sdm/dist/sdm/`:
 
-**Camera.js** — add this at the top of the `getSnapshot()` method, before the existing logo-fallback code:
+**Camera.js** — two changes:
+
+First, add this at the top of `getSnapshot()`, before the existing logo-fallback code:
 
 ```javascript
 try {
@@ -400,6 +417,14 @@ The 90-second mtime check prevents a camera that was turned off from showing an 
 
 The key derivation (`toLowerCase()`, non-alphanum to `_`, strip leading/trailing `_`) must match the Python `stream_key()` function in the sync script. Both derive from the SDM room name (the `displayName` in `parentRelations`).
 
+Second, in the `event()` method, find the `if (this.onMotion)` line (inside the `CameraMotion`/`CameraPerson` case) and add this just before it:
+
+```javascript
+try { require('child_process').execSync('touch /homebridge/nest-snaps/.refresh'); } catch(e) {}
+```
+
+This signals the warmer to grab a fresh frame immediately when motion or a person is detected, so the tile shows who's there rather than a stale frame from the last cycle.
+
 **Both patches live in `node_modules` and will be wiped by any `npm install` of the plugin.** Save copies outside `node_modules` with a script that re-applies them.
 
 ## Part 5: Verify
@@ -411,7 +436,7 @@ docker restart homebridge
 After about 30 seconds:
 
 1. **Check warm streams:** `curl -s http://127.0.0.1:1985/api/streams` — each camera should show receiver bytes increasing
-2. **Check snapshot files:** `ls -la /run/nest-snaps/` — a `.jpg` per camera, refreshing every ~20 seconds
+2. **Check snapshot files:** `ls -la /run/nest-snaps/` — a `.jpg` per camera, refreshing every ~10 seconds (and immediately on motion events)
 3. **Open Apple Home** — tiles should show real camera images instead of the placeholder
 
 ### Troubleshooting
@@ -443,7 +468,7 @@ Preload costs ~12 `ExtendWebRtcStream` calls/hour/camera — well within the 100
 | Metric | Value |
 |---|---|
 | Cached snapshot served | ~26 ms |
-| CPU (idle, with 3 warm streams) | ~0% (brief spikes during 20s transcode) |
+| CPU (idle, with 3 warm streams) | ~0% (brief spikes during 10s transcode cycle) |
 | Bandwidth per camera | ~1.5 Mbps continuous |
 | RAM for snapshot files | ~200 KB |
 | Stream startup (with PR #212 + `vEncoder: "copy"`) | First keyframe at +2127ms |
