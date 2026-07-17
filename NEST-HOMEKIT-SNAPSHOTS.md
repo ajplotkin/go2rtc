@@ -1,16 +1,16 @@
 # Nest Cameras in Apple HomeKit: Real Snapshots Instead of the Google "G" Logo
 
-**The problem:** Google Nest cameras show a static Google logo ("G") as their tile image in Apple HomeKit. You never see a real preview of what the camera sees unless you tap in and wait for the live stream to load. Commercial solutions like the Starling Home Hub ($99) solve this, but there's been no open-source answer.
+**The problem:** If you bridge Google Nest cameras to Apple HomeKit using `homebridge-google-nest-sdm`, the camera tiles show a static Google logo instead of a real image. There is no snapshot API for WebRTC-only Nest cameras -- Google removed the `CameraEventImage` trait when they migrated devices to the Google Home app. The plugin cannot produce a still image, so it serves a placeholder. You only see the actual camera feed after tapping in and waiting several seconds for the live stream to negotiate.
 
-**This guide gets you real, continuously-refreshed camera snapshots on your HomeKit tiles using free, open-source tools.** It also cuts live-stream startup time from ~8 seconds to ~2 seconds.
+**This guide gets you real, continuously-refreshed camera tile images using a patched go2rtc that holds a warm stream and serves frames on demand.** It also cuts live-stream startup time from ~8 seconds to ~2 seconds.
 
-Works with all Google Nest cameras and doorbells, including the newer WebRTC-only models that have no RTSP support.
+Works with all Google Nest cameras and doorbells that use the SDM API, including the newer WebRTC-only models that have no RTSP support.
 
-## Why the "G" Exists
+## Why There Are No Snapshots
 
-When Google migrated Nest cameras to the Google Home app, they converted them from RTSP to WebRTC and removed the `CameraEventImage` trait. The Homebridge plugin (`homebridge-google-nest-sdm`) can only produce snapshots via that trait, so it falls back to a static logo.
+Google's SDM API has no on-demand snapshot endpoint for WebRTC cameras. The only image source was the `CameraEventImage` trait, which Google removed when devices were migrated to the Google Home app. Without it, `homebridge-google-nest-sdm` has nothing to return from `getSnapshot()` and serves a static logo file.
 
-There is no Google API to request a still image from these cameras. The only way to get a picture is to grab a frame from a live video stream.
+The only way to get a real picture is to grab a frame from a live video stream -- which is what this guide sets up.
 
 ## Architecture
 
