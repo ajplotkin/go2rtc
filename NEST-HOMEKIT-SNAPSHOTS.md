@@ -4,7 +4,12 @@ You have Google Nest cameras. You want them in Apple HomeKit. And you want to ac
 
 This is harder than it should be. Google does not offer Nest cameras through HomeKit natively, and when they migrated Nest devices to the Google Home app, they removed the API that provided still images. No integration — commercial or open-source — can request a snapshot from these cameras anymore. The only way to get a real picture is to grab a frame from a live video stream.
 
-This guide walks through the full setup from scratch: getting API access to your Nest cameras, bridging them into HomeKit, and then solving the snapshot problem by keeping a warm stream and serving frames from it. By the end you'll have real camera images on your HomeKit tiles, refreshed every 10 seconds, with live stream startup in about 2 seconds.
+This guide walks through the full setup from scratch: getting API access to your Nest cameras, bridging them into HomeKit, and then solving the snapshot problem by keeping a warm stream and serving frames from it. By the end you'll have:
+
+- **Real camera images on your HomeKit tiles** — refreshed every 10 seconds, and instantly on motion or doorbell events (so the tile shows *who's there*, not a stale frame)
+- **~2 second live stream startup** — down from ~8 seconds stock
+- **Motion and doorbell event notifications** in Apple Home
+- **Automatic camera discovery** — new cameras appear without editing config files
 
 **Everything here is open source and runs on a Raspberry Pi.**
 
