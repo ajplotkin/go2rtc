@@ -1,50 +1,50 @@
-# Nest Cameras in Apple HomeKit: Real Snapshots Instead of the Google "G" Logo
+# How to Get Real Snapshots from Nest Cameras in Apple HomeKit
 
-**The problem:** If you bridge Google Nest cameras to Apple HomeKit using `homebridge-google-nest-sdm`, the camera tiles show a static Google logo instead of a real image. There is no snapshot API for WebRTC-only Nest cameras -- Google removed the `CameraEventImage` trait when they migrated devices to the Google Home app. The plugin cannot produce a still image, so it serves a placeholder. You only see the actual camera feed after tapping in and waiting several seconds for the live stream to negotiate.
+If you use [homebridge-google-nest-sdm](https://github.com/potmat/homebridge-google-nest-sdm) to bring your Nest cameras into Apple HomeKit, you've probably noticed that your camera tiles never show a real image -- just a static logo. You have to tap in and wait several seconds for the live stream to connect before you see anything.
 
-**This guide gets you real, continuously-refreshed camera tile images using a patched go2rtc that holds a warm stream and serves frames on demand.** It also cuts live-stream startup time from ~8 seconds to ~2 seconds.
+This is a Google limitation, not a bug in the plugin. When Google migrated Nest devices to the Google Home app, they switched cameras from RTSP to WebRTC and removed the `CameraEventImage` API trait. There is no remaining endpoint to request a still image. The plugin's `getSnapshot()` has nothing to call, so it serves a placeholder.
 
-Works with all Google Nest cameras and doorbells that use the SDM API, including the newer WebRTC-only models that have no RTSP support.
+This guide shows how to work around it using open-source tools, most of which already exist -- they just need a patch and some glue to work together. The result: **real, continuously-refreshed camera images on your HomeKit tiles**, plus faster live stream startup (~2s instead of ~8s).
 
-## Why There Are No Snapshots
+## Prerequisites
 
-Google's SDM API has no on-demand snapshot endpoint for WebRTC cameras. The only image source was the `CameraEventImage` trait, which Google removed when devices were migrated to the Google Home app. Without it, `homebridge-google-nest-sdm` has nothing to return from `getSnapshot()` and serves a static logo file.
+You need a working setup of:
 
-The only way to get a real picture is to grab a frame from a live video stream -- which is what this guide sets up.
+- **[homebridge-google-nest-sdm](https://github.com/potmat/homebridge-google-nest-sdm)** by [@potmat](https://github.com/potmat) -- the Homebridge plugin that bridges Nest cameras to HomeKit via Google's SDM API
+- **[go2rtc](https://github.com/AlexxIT/go2rtc)** by [@AlexxIT](https://github.com/AlexxIT) -- a versatile camera streaming tool with native Nest/SDM support, RTSP output, and JPEG snapshot serving
+- A Google [Device Access](https://developers.google.com/nest/device-access) project with working credentials (client ID, client secret, refresh token, project ID)
+- A Raspberry Pi 4 or any Linux box with Docker
 
-## Architecture
+This guide also incorporates **[PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212)** by [@littlepope81](https://github.com/littlepope81), which reduces stream startup latency from ~8s to ~2s via FIR keyframe requests, `-fpsprobesize 0`, and REMB bandwidth signaling. That PR is unmerged but tested and working.
+
+## How It Works
+
+The trick is that even though Google offers no snapshot API, the cameras *do* stream live H264 video over WebRTC. If you keep one stream warm per camera, you can grab a frame from it whenever HomeKit asks.
+
+[go2rtc](https://github.com/AlexxIT/go2rtc) already has the pieces for this: a `nest:` source that handles SDM WebRTC negotiation (including automatic stream extension before the 5-minute expiry), a `preload:` option that keeps streams connected, and a `/api/frame.jpeg` endpoint that transcodes a frame on demand. The plugin just needs to know where to find them.
 
 ```
 Google Nest Cloud
     |
-    | (WebRTC, kept warm by preload)
+    | (WebRTC, kept warm by go2rtc preload)
     v
-patched go2rtc -----> /api/frame.jpeg (cached, ~26ms)
+go2rtc ──────────> /api/frame.jpeg (cached, ~26ms)
     |                       |
-    | (RTSP)                | (every 20s)
+    | (RTSP out)            | (warmer pulls every 20s)
     v                       v
-Homebridge          snapshot-warmer.sh
-(live streams)      writes to /run/nest-snaps/ (tmpfs)
-    |                       |
-    | (HAP/SRTP)            | (file read, ~1ms)
+Homebridge          /run/nest-snaps/*.jpg (tmpfs)
+(live streams)              |
+    |                       | (file read, ~1ms)
     v                       v
 Apple HomeKit       patched Camera.js getSnapshot()
 (real tile images)
 ```
 
-One warm stream per camera serves double duty: HomeKit live streams are near-instant (the connection is already open), and a warmer script grabs a JPEG every 20 seconds for the tile preview.
+## The go2rtc IPv6 Bug
 
-## What You Need
+There is one blocker: **stock go2rtc cannot stream Nest cameras on many home networks.** Its `nest:` source gathers ICE candidates on all network types including IPv6. On hosts where IPv6 addresses exist but have no working route -- which is extremely common in home setups -- [pion](https://github.com/pion/webrtc)'s ICE agent fails silently and no media flows.
 
-- A Raspberry Pi 4 (or any Linux box) running Homebridge with `homebridge-google-nest-sdm`
-- A Google Device Access project with working credentials (client ID, client secret, refresh token, project ID)
-- ~30 minutes
-
-## The Problem with Stock go2rtc
-
-Stock go2rtc v1.9.14 **cannot stream Nest cameras on many home networks**. The `nest:` source gathers ICE candidates on all network types including IPv6. On hosts where IPv6 addresses exist but have no working route (extremely common), pion's ICE agent fails silently and no media ever flows.
-
-The `webrtc: filters:` YAML config exists but **does not reach the nest source** -- `pkg/nest/client.go` calls `webrtc.NewAPI()` with nil filters, bypassing all config. There is no workaround without patching Go. ([go2rtc #2311](https://github.com/AlexxIT/go2rtc/issues/2311))
+The `webrtc: filters:` config exists but `pkg/nest/client.go` bypasses it entirely by calling `webrtc.NewAPI()` with nil filters. There is no YAML workaround. See [go2rtc #2311](https://github.com/AlexxIT/go2rtc/issues/2311) for discussion and diagnostic data.
 
 This fork fixes it with one line:
 
@@ -53,13 +53,13 @@ This fork fixes it with one line:
 rtcAPI, err := webrtc.NewServerAPI("", "", &webrtc.Filters{Networks: []string{"udp4"}})
 ```
 
-It also removes a retry loop that burned ~130 SDM API calls/hour per offline camera (over Google's documented 100/hour quota).
+It also removes an inner retry loop that burned ~130 SDM API calls/hour per offline camera -- over Google's documented 100/hour quota -- while holding the producer mutex for 90+ seconds.
 
-## Step-by-Step Setup
+**If your IPv6 works fine**, you may not need this patch. Try stock go2rtc first; if you see `nest: wrong status: 400 Bad Request` or streams that start but produce no media, this is likely why.
+
+## Step by Step
 
 ### 1. Build the patched go2rtc
-
-Clone this fork and build on the Pi (or cross-compile):
 
 ```bash
 git clone https://github.com/ajplotkin/go2rtc.git
@@ -75,79 +75,81 @@ docker run --rm -v "$PWD":/src -w /src \
 
 ### 2. Create a Docker image
 
-```bash
-mkdir -p ~/go2rtc2
-cp go2rtc_patched ~/go2rtc2/
+The base image from [@AlexxIT](https://github.com/AlexxIT) provides ffmpeg (needed for the MJPEG transcode leg). We just swap in the patched binary:
 
-cat > ~/go2rtc2/Dockerfile <<'EOF'
+```bash
+mkdir -p ~/go2rtc-nest
+cp go2rtc_patched ~/go2rtc-nest/
+
+cat > ~/go2rtc-nest/Dockerfile <<'EOF'
 FROM alexxit/go2rtc:1.9.14
 COPY go2rtc_patched /usr/local/bin/go2rtc
 EOF
 
-docker build -t go2rtc-nestfix:1.9.14 ~/go2rtc2/
+docker build -t go2rtc-nestfix:1.9.14 ~/go2rtc-nest/
 ```
 
-### 3. Auto-discover your cameras and generate the config
+### 3. Discover your cameras and generate the config
 
-Create `~/scripts/nest-go2rtc-sync.py`:
+This script reads your existing Homebridge credentials (single source of truth -- no duplicated secrets), discovers cameras via the SDM API, and writes a go2rtc config with a warm stream per camera.
+
+Save as `~/scripts/nest-go2rtc-sync.py`:
 
 ```python
 #!/usr/bin/env python3
 """
-Reads Nest credentials from Homebridge's config.json, discovers cameras
-via the SDM API, and generates go2rtc.yaml with a warm stream per camera.
+Auto-discovers Nest cameras from the SDM API and generates go2rtc.yaml.
+Credentials are read from Homebridge's config.json.
 
-Stream key = SDM room name, lowercased, non-alphanum replaced with underscore.
-This must match the key derivation in the patched Camera.js getSnapshot().
+Stream key = SDM room name, lowercased, non-alphanum -> underscore.
+This MUST match the key derivation in the patched Camera.js.
 """
 import json, sys, urllib.parse, urllib.request, subprocess, re, argparse
 
-def token(cid, cs, rt):
+def get_token(cid, cs, rt):
     d = urllib.parse.urlencode({"client_id": cid, "client_secret": cs,
                                 "refresh_token": rt, "grant_type": "refresh_token"}).encode()
     with urllib.request.urlopen("https://oauth2.googleapis.com/token", data=d, timeout=30) as r:
         return json.load(r)["access_token"]
 
-def devices(at, project):
+def list_devices(at, project):
     req = urllib.request.Request(
         f"https://smartdevicemanagement.googleapis.com/v1/enterprises/{project}/devices",
         headers={"Authorization": "Bearer " + at})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r).get("devices", [])
 
-def key_for(dev):
+def stream_key(dev):
     parents = [p.get("displayName") for p in dev.get("parentRelations", []) if p.get("displayName")]
     if not parents:
         return None
     return re.sub(r"[^a-z0-9]+", "_", parents[0].lower()).strip("_")
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--hb-config", default="/path/to/homebridge/config.json")
-ap.add_argument("--out", default="/path/to/go2rtc2/go2rtc.yaml")
-ap.add_argument("--container", default="go2rtc")
+ap.add_argument("--hb-config", required=True, help="Path to Homebridge config.json")
+ap.add_argument("--out", required=True, help="Path to write go2rtc.yaml")
+ap.add_argument("--container", default="go2rtc", help="Docker container name to restart")
 ap.add_argument("--dry-run", action="store_true")
 a = ap.parse_args()
 
 cfg = json.load(open(a.hb_config))
 nest = next((p for p in cfg["platforms"] if p.get("platform") == "homebridge-google-nest-sdm"), None)
 if not nest:
-    print("no nest platform in homebridge config"); sys.exit(0)
+    sys.exit("No homebridge-google-nest-sdm platform found in config")
 
 cid, cs, rt, proj = nest["clientId"], nest["clientSecret"], nest["refreshToken"], nest["projectId"]
-at = token(cid, cs, rt)
+at = get_token(cid, cs, rt)
 
-streams, preload = [], []
-seen_keys = set()
-for d in devices(at, proj):
+streams, preload, seen = [], [], set()
+for d in list_devices(at, proj):
     if d.get("type", "").split(".")[-1] not in ("CAMERA", "DOORBELL"):
         continue
-    k = key_for(d)
+    k = stream_key(d)
     if not k:
         continue
-    if k in seen_keys:
-        print(f"  ERROR: duplicate room key '{k}' -- two devices in the same room. Refusing.")
-        sys.exit(1)
-    seen_keys.add(k)
+    if k in seen:
+        sys.exit(f"ERROR: duplicate room key '{k}' -- two devices in the same room")
+    seen.add(k)
     dev_id = d["name"].split("/devices/")[1]
     q = urllib.parse.urlencode({
         "client_id": cid, "client_secret": cs, "device_id": dev_id,
@@ -157,7 +159,7 @@ for d in devices(at, proj):
     print(f"  discovered: {k}")
 
 if not streams:
-    print("  ERROR: no cameras discovered -- refusing to write empty config"); sys.exit(1)
+    sys.exit("ERROR: no cameras discovered -- refusing to write empty config")
 
 out = ("api:\n  listen: \"127.0.0.1:1985\"\nrtsp:\n  listen: \":8554\"\n"
        "webrtc:\n  listen: \":8555\"\nlog:\n  level: info\n\nstreams:\n"
@@ -170,19 +172,21 @@ except FileNotFoundError:
 if cur == out:
     print("config unchanged"); sys.exit(0)
 if a.dry_run:
-    print("--- would write ---"); sys.exit(0)
+    print("would write new config"); sys.exit(0)
+
 open(a.out, "w").write(out)
-print(f"config written; restarting {a.container}")
+print(f"config written -> restarting {a.container}")
 subprocess.run(["docker", "restart", a.container], check=False,
                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 ```
 
-Run it:
 ```bash
 python3 ~/scripts/nest-go2rtc-sync.py \
   --hb-config ~/volumes/homebridge/config.json \
-  --out ~/go2rtc2/go2rtc.yaml
+  --out ~/go2rtc-nest/go2rtc.yaml
 ```
+
+**Important:** The script builds `nest:` URLs using proper URL encoding (the refresh token contains `//` which must be encoded as `%2F%2F`). Hand-written URLs will fail with a 400. If you skip the script, use go2rtc's own `GET /api/nest` endpoint to generate correctly-encoded URLs.
 
 ### 4. Start go2rtc
 
@@ -190,14 +194,13 @@ python3 ~/scripts/nest-go2rtc-sync.py \
 docker run -d --name go2rtc \
   --restart unless-stopped \
   --network host \
-  -v ~/go2rtc2/go2rtc.yaml:/config/go2rtc.yaml \
+  -v ~/go2rtc-nest/go2rtc.yaml:/config/go2rtc.yaml \
   go2rtc-nestfix:1.9.14
 ```
 
-Wait ~30 seconds for the streams to warm up, then verify:
+Wait ~30 seconds, then verify the streams are warm:
 
 ```bash
-# Check warm streams
 curl -s http://127.0.0.1:1985/api/streams | python3 -c "
 import sys, json
 for name, s in json.load(sys.stdin).items():
@@ -205,26 +208,38 @@ for name, s in json.load(sys.stdin).items():
         for r in (p.get('receivers') or []))
         for p in (s.get('producers') or []))
     print(f'  {name}: {\"WARM\" if warm else \"cold\"}')"
+```
 
-# Grab a test frame
+Test a snapshot:
+
+```bash
 curl -o /tmp/test.jpg "http://127.0.0.1:1985/api/frame.jpeg?src=front_door&cache=30s"
+file /tmp/test.jpg   # should say "JPEG image data"
 ```
 
 ### 5. Set up the snapshot warmer
 
-The warmer pulls a JPEG from each warm stream every 20 seconds and writes it to tmpfs (RAM). This avoids SD card wear and ensures the plugin never waits for a frame.
+The warmer pulls a JPEG from each warm stream every 20 seconds and writes it to disk for the plugin to read. It auto-discovers streams from go2rtc, so cameras added later appear automatically.
 
-Create `~/scripts/go2rtc-snapshot-warmer.sh`:
+**If your system runs on an SD card** (like a Raspberry Pi), put the snapshots in tmpfs (RAM). Writing ~100KB JPEGs every 20 seconds per camera is ~780 MB/day of pointless flash wear:
+
+```bash
+echo 'd /run/nest-snaps 0755 1000 1000 -' | sudo tee /etc/tmpfiles.d/nest-snaps.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/nest-snaps.conf
+```
+
+Save as `~/scripts/go2rtc-snapshot-warmer.sh`:
 
 ```bash
 #!/bin/bash
-# Writes a fresh JPEG per warm go2rtc stream to /run/nest-snaps/ (tmpfs).
-# Stream list is auto-discovered from go2rtc, so new cameras appear automatically.
-DIR=/run/nest-snaps
+# Writes a fresh JPEG per warm go2rtc stream.
+# Only polls streams that have active media (skips cameras that are off).
+# Prunes stale files so off cameras show the honest logo, not an old frame.
+DIR=/run/nest-snaps    # tmpfs -- change to a regular path if not on SD card
 API=http://127.0.0.1:1985
 mkdir -p "$DIR"
 while true; do
-  STREAMS=$(curl -s -m 10 "$API/api/streams" | python3 -c '
+  WARM=$(curl -s -m 10 "$API/api/streams" | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -235,7 +250,7 @@ for name, s in d.items():
         if any((r.get("bytes") or 0) > 0 for r in (p.get("receivers") or [])):
             print(name); break
 ' 2>/dev/null || echo "")
-  for s in $STREAMS; do
+  for s in $WARM; do
     [[ "$s" =~ ^[a-z0-9_]+$ ]] || continue
     if curl -sf -m 15 -o "$DIR/.$s.tmp" "$API/api/frame.jpeg?src=$s&cache=30s"; then
       if [ -s "$DIR/.$s.tmp" ] && [ "$(stat -c %s "$DIR/.$s.tmp")" -gt 1000 ]; then
@@ -244,17 +259,9 @@ for name, s in d.items():
     fi
     rm -f "$DIR/.$s.tmp" 2>/dev/null || true
   done
-  # Remove stale snapshots (camera turned off -> no fresh frame -> honest logo instead)
   find "$DIR" -name '*.jpg' -mmin +2 -delete 2>/dev/null || true
   sleep 20
 done
-```
-
-Set up tmpfs (so snapshots live in RAM, not on the SD card):
-
-```bash
-echo 'd /run/nest-snaps 0755 1000 1000 -' | sudo tee /etc/tmpfiles.d/nest-snaps.conf
-sudo systemd-tmpfiles --create /etc/tmpfiles.d/nest-snaps.conf
 ```
 
 Install as a systemd service:
@@ -262,10 +269,10 @@ Install as a systemd service:
 ```ini
 # /etc/systemd/system/go2rtc-snapshot-warmer.service
 [Unit]
-Description=Keep go2rtc snapshot cache warm for Homebridge/HomeKit
+Description=Keep go2rtc snapshot cache warm for Homebridge
 After=docker.service
 [Service]
-ExecStart=/path/to/go2rtc-snapshot-warmer.sh
+ExecStart=/home/YOUR_USER/scripts/go2rtc-snapshot-warmer.sh
 Restart=always
 RestartSec=10
 [Install]
@@ -273,122 +280,98 @@ WantedBy=multi-user.target
 ```
 
 ```bash
+chmod +x ~/scripts/go2rtc-snapshot-warmer.sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now go2rtc-snapshot-warmer.service
 ```
 
-### 6. Patch Homebridge
+### 6. Patch the Homebridge plugin
 
-**Important:** If you're running your Homebridge container with Docker, you need to mount the tmpfs snapshots directory:
+Mount the snapshot directory into the Homebridge container. **Without this mount, the plugin can't see the files and tiles will show the logo:**
 
 ```bash
 docker run -d --name homebridge \
   ... \
   -v /path/to/homebridge:/homebridge \
-  -v /run/nest-snaps:/homebridge/nest-snaps \   # <-- REQUIRED for snapshots
+  -v /run/nest-snaps:/homebridge/nest-snaps \
   homebridge/homebridge:latest
 ```
 
-Then patch `homebridge-google-nest-sdm`. Two files need changes:
+Then patch two files in `node_modules/homebridge-google-nest-sdm/dist/sdm/`:
 
-**`dist/sdm/Camera.js` -- serve real snapshots from the warmer:**
-
-Find the `getSnapshot()` method and add this before the logo fallback:
+**Camera.js** -- add this at the top of `getSnapshot()`, before the logo fallback:
 
 ```javascript
-async getSnapshot() {
-    if (this.image)
-        return this.image;
-    // Serve a real frame from the go2rtc warm stream (written by the warmer)
-    try {
-        const key = (this.displayName || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-        const snapPath = '/homebridge/nest-snaps/' + key + '.jpg';
-        const st = await fs_1.default.promises.stat(snapPath);
-        if (Date.now() - st.mtimeMs > 90000) {
-            this.log.debug('snapshot too stale, using logo', this.getDisplayName());
-        } else {
-            const buf = await fs_1.default.promises.readFile(snapPath);
-            if (buf && buf.length > 1000)
-                return buf;
-        }
+// Read a real frame from the warmer (file on disk, ~1ms)
+try {
+    const key = (this.displayName || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    const snapPath = '/homebridge/nest-snaps/' + key + '.jpg';
+    const st = await fs_1.default.promises.stat(snapPath);
+    if (Date.now() - st.mtimeMs > 90000) {
+        this.log.debug('snapshot too stale (' + Math.round((Date.now() - st.mtimeMs)/1000) + 's), using logo', this.getDisplayName());
+    } else {
+        const buf = await fs_1.default.promises.readFile(snapPath);
+        if (buf && buf.length > 1000)
+            return buf;
     }
-    catch (e) {
-        this.log.debug('no warm snapshot on disk, using logo: ' + e, this.getDisplayName());
-    }
-    // ... original logo fallback continues below
+}
+catch (e) {
+    this.log.debug('no warm snapshot on disk, using logo: ' + e, this.getDisplayName());
+}
 ```
 
-**`dist/sdm/Api.js` -- fix the Pub/Sub crash on relationUpdate events:**
+The 90-second mtime check prevents a camera that was turned off from showing an indefinitely stale frame -- it falls back to the logo honestly.
 
-Find `if (event.resourceUpdate.events) {` and add a guard before it:
+**Api.js** -- add this guard before `if (event.resourceUpdate.events)`:
 
 ```javascript
 if (!event || !event.resourceUpdate) {
     this.log.debug('Event without resourceUpdate (e.g. relationUpdate), ignoring');
     return;
 }
-if (event.resourceUpdate.events) {
 ```
 
-Without this guard, the plugin crashes on the first Pub/Sub message Google sends after you enable events. ([Issue #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214))
+Without this, the plugin crashes on `relationUpdate` events that Google sends when Pub/Sub is first enabled. See [issue #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214).
 
-**These patches live in `node_modules` -- any `npm install` of the plugin wipes them.** Save copies outside `node_modules` and create a re-apply script.
+**Both patches live in `node_modules` and will be wiped by any `npm install`.** Save copies outside `node_modules` with a re-apply script.
 
-### 7. Restart and verify
+### 7. Verify
 
 ```bash
 docker restart homebridge
-
-# After ~30 seconds, check:
-# - Open Apple Home -- tiles should show real camera images
-# - No "snapshot handler is slow to respond" warnings in the log
-# - Snapshots refresh every ~20 seconds
 ```
 
-## Important Notes
+After ~30 seconds:
+- Open Apple Home -- tiles should show real camera images
+- Check the Homebridge log for `snapshot too stale` or `no warm snapshot` (should be zero)
+- Snapshots refresh every ~20 seconds
 
-### SD Card Wear
-If your system runs on an SD card, the snapshots **must** be on tmpfs (RAM). Writing ~100KB JPEGs every 20 seconds per camera is ~780 MB/day of pointless flash wear. The tmpfs setup above avoids this entirely.
+## Things to Know
 
-### Cameras That Are Off
-When a camera is switched off in the Google Home app, Google returns `FAILED_PRECONDITION: "The camera is not available for streaming"`. The system handles this correctly:
-- go2rtc's preload backs off (no quota burn, thanks to the removed retry loop)
-- The warmer skips cold streams (only polls warm ones)
-- Stale snapshot files are pruned after 2 minutes
-- Camera.js rejects snapshots older than 90 seconds
-- The tile honestly shows the logo for off cameras
+**Cameras that are off** are handled correctly. When a camera is switched off in the Google Home app, the warmer skips its stream, stale files are pruned after 2 minutes, and Camera.js rejects snapshots older than 90 seconds. The tile honestly shows the logo. When the camera turns back on, preload reconnects and snapshots resume automatically.
 
-When the camera is turned back on, preload reconnects and snapshots resume automatically.
+**Home/Away Assist** may automatically turn cameras off when you're home. This is the most common reason for cameras appearing to work intermittently. Check: Google Home app > Settings > Home & Away Routines.
 
-### Home/Away Assist
-Google's Home/Away Assist may automatically turn cameras off when you're home. This is the most common reason for cameras appearing to work intermittently. Check: Google Home app > Settings > Home & Away Routines.
+**SDM quotas** are well within limits. Preload costs ~12 `ExtendWebRtcStream` calls/hour/camera (the device limit is 100/hour). The warmer makes zero SDM calls -- it reads from go2rtc's local cache.
 
-### SDM API Quotas
-- Preload costs ~12 `ExtendWebRtcStream` calls/hour/camera (well within the 100/hour device limit)
-- The warmer makes zero SDM calls (it reads from go2rtc's local cache)
-- With the retry loop removed, an off camera costs ~1 call per outer reconnect cycle (60s backoff)
+**Live stream latency** also improves. With [PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) by [@littlepope81](https://github.com/littlepope81) installed alongside `vEncoder: "copy"`, measured stream startup on a Pi 4: **first keyframe fully received at +2127ms** (down from ~8s stock). The remaining ~4s to tile-open is Apple's HAP/SRTP setup and isn't addressable from Homebridge.
 
-### Stream URL Encoding
-**Always build `nest:` URLs from go2rtc's own `/api/nest` discovery endpoint.** Hand-written URLs fail because the refresh token contains `//` which must be URL-encoded (`1%2F%2F...`), and `protocols=WEB_RTC` must be present. The sync script handles this automatically.
+## Credits
 
-### Performance
-Measured on a Raspberry Pi 4 (arm64):
-- Cached snapshot: **~26 ms**
-- CPU: **~0%** idle, brief spikes during the 20s transcode cycle
-- Bandwidth: ~1.5 Mbps per camera (wired gigabit; irrelevant on an uncapped connection)
-- RAM: ~200 KB for snapshot files on tmpfs
+This guide builds on the work of:
 
-### Live Stream Latency (Bonus)
-With [PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) installed alongside `vEncoder: "copy"`, measured stream startup:
-- First keyframe fully received: **+2127 ms** (down from ~8s stock)
-- The remaining ~4s to tile-open is Apple's HAP/SRTP setup, not addressable from Homebridge
+- **[@AlexxIT](https://github.com/AlexxIT)** -- [go2rtc](https://github.com/AlexxIT/go2rtc), which provides the Nest WebRTC source, stream preload, RTSP output, and JPEG snapshot serving that make all of this possible
+- **[@potmat](https://github.com/potmat)** -- [homebridge-google-nest-sdm](https://github.com/potmat/homebridge-google-nest-sdm), the Homebridge plugin that bridges Nest cameras to HomeKit
+- **[@littlepope81](https://github.com/littlepope81)** -- [PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212), which dramatically reduces stream startup latency via FIR keyframe requests, frame-rate probe skipping, and REMB bandwidth signaling
+- **[werift](https://github.com/nicktournux/werift-webrtc)** -- the WebRTC library used by `homebridge-google-nest-sdm` that handles the Nest WebRTC negotiation correctly where pion (used by go2rtc) currently has IPv6 issues
+- **[pion/webrtc](https://github.com/pion/webrtc)** -- the Go WebRTC library used by go2rtc
 
-## Related Issues and PRs
+## Related Issues
 
-- [go2rtc #2311](https://github.com/AlexxIT/go2rtc/issues/2311) -- nest 400 / ICE failure (our comment with diagnosis + SDP validation data)
-- [homebridge-google-nest-sdm #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214) -- Api.js crash on relationUpdate
-- [homebridge-google-nest-sdm #215](https://github.com/potmat/homebridge-google-nest-sdm/issues/215) -- README corrections (subscriptionId, gcpProjectId, aEncoder, Node 24.17.0, self-hosted Pub/Sub)
-- [homebridge-google-nest-sdm PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) -- stream startup latency fix (our hardware validation comment)
+- [go2rtc #2311](https://github.com/AlexxIT/go2rtc/issues/2311) -- `nest: wrong status: 400` / ICE failure diagnosis and SDP validation data
+- [homebridge-google-nest-sdm #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214) -- Api.js crash on `relationUpdate` events
+- [homebridge-google-nest-sdm #215](https://github.com/potmat/homebridge-google-nest-sdm/issues/215) -- README corrections (subscriptionId/gcpProjectId confusion, self-hosted Pub/Sub, Node 24.17.0 regression, `aEncoder` non-option)
+- [homebridge-google-nest-sdm PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) -- stream startup latency fix
 
 ## License
 
