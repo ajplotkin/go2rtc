@@ -454,6 +454,8 @@ After about 30 seconds:
 
 **Node v24.17.0 breaks the plugin entirely** with `ERR_STREAM_PREMATURE_CLOSE` on every OAuth call. This is a Node.js regression ([nodejs/node#63989](https://github.com/nodejs/node/issues/63989)), not a plugin bug. Fixed in Node 24.18.0. If you're on the official Homebridge Docker image, pull the latest.
 
+**Motion notifications not arriving on your phone?** HomeKit defaults motion notifications to **off** for new camera accessories. In the Apple Home app: tap the camera → scroll down → **Status and Notifications** → turn on **Motion Notifications** (and **Activity Notifications** if available). You also need an Apple Home Hub (Apple TV, HomePod, or iPad) for notifications to push when you're away.
+
 ## Reference
 
 ### SDM API Quotas
