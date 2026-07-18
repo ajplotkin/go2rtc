@@ -22,7 +22,13 @@ func videoToMedia(codecs []camera.VideoCodecConfiguration) *core.Media {
 		for _, param := range codec.CodecParams {
 			// get best profile and level
 			profileID := core.Max(param.ProfileID)
+			if int(profileID) >= len(videoProfiles) {
+				profileID = byte(len(videoProfiles) - 1)
+			}
 			level := core.Max(param.Level)
+			if int(level) >= len(videoLevels) {
+				level = byte(len(videoLevels) - 1)
+			}
 			profile := videoProfiles[profileID] + videoLevels[level]
 			mediaCodec := &core.Codec{
 				Name:      videoCodecs[codec.CodecType],
