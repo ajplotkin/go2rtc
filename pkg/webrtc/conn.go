@@ -162,7 +162,10 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 					save(pl)
 				}
 				if spropSPS != nil && spropPPS != nil {
-					codec.FmtpLine += ";sprop-parameter-sets=" +
+					if codec.FmtpLine != "" {
+						codec.FmtpLine += ";"
+					}
+					codec.FmtpLine += "sprop-parameter-sets=" +
 						base64.StdEncoding.EncodeToString(spropSPS) + "," +
 						base64.StdEncoding.EncodeToString(spropPPS)
 					captureSprop = false
