@@ -115,6 +115,14 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// keyframe + probe (~3.7s -> near-instant). Google's WebRTC SDP has profile-level-id but
 		// no sprop; SPS/PPS arrive in-band (usually bundled in a STAP-A). Upstream does the
 		// equivalent for H265 (pkg/dvrip). Gated on FormatName like the PLI patch above.
+		//
+		// Note (accepted race): FmtpLine is appended from this receive goroutine without a
+		// lock. In practice SPS/PPS are captured within the first few frames (the 2s PLI above
+		// forces an early keyframe), before any RTSP consumer's DESCRIBE clones the codec, so
+		// the write happens-before the read. A -race build could flag a consumer connecting
+		// during the sub-2s warm-up window; upstream's H265 append in pkg/dvrip is unguarded
+		// the same way. Codec.Match ignores FmtpLine, so this can't affect media matching.
+		// Left lock-free to mirror upstream; documented rather than hidden.
 		captureSprop := c.FormatName == "nest/webrtc" && codec.Name == core.CodecH264 &&
 			!strings.Contains(codec.FmtpLine, "sprop-parameter-sets=")
 		var spropSPS, spropPPS []byte

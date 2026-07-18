@@ -131,6 +131,8 @@ The `webrtc: filters:` YAML config exists for restricting network types, but `pk
 rtcAPI, err := webrtc.NewServerAPI("", "", &webrtc.Filters{Networks: []string{"udp4"}})
 ```
 
+Note the tradeoff: `udp4` restricts ICE to IPv4/UDP, so it also drops TCP ICE candidates. On a normal home LAN — where the Pi reaches Google's relays over UDP/IPv4 — that is exactly what you want, and it's what fixes the silent failure. The only setups this could hurt are ones whose *only* working path to the relay is IPv6 or TCP (rare); the proper general fix is to plumb the real `webrtc: filters:` config through to `pkg/nest`, which this fork notes in a code comment but hardcodes `udp4` as a working reference.
+
 The fork also removes an inner retry loop in `rtcConn` that burned ~130 SDM API calls/hour per offline camera (over Google's documented 100/hour quota).
 
 ### Build from this fork
@@ -261,6 +263,10 @@ python3 ~/scripts/nest-go2rtc-sync.py \
   --hb-config /path/to/homebridge/config.json \
   --out ~/go2rtc-nest/go2rtc.yaml
 ```
+
+You only need to re-run this when your set of cameras or rooms changes (add/remove a camera, rename a room) — not on a schedule. The generated config is static; the credentials it embeds come from Homebridge's `config.json`, and the OAuth *refresh* token is long-lived (go2rtc mints short-lived access tokens itself at runtime), so a once-written config keeps working. If you do automate it (e.g. a weekly systemd timer to pick up new cameras), be aware of the next point.
+
+> **A go2rtc restart drops every warm stream.** The sync script rewrites `go2rtc.yaml` and restarts the container to load it, and any restart tears down all active WebRTC sessions — tiles briefly fall back to the placeholder and live views drop until the streams re-warm (~30s) and re-extend. So restart go2rtc deliberately (config change, upgrade), not on a frequent timer. This is also why the config is kept static rather than regenerated every cycle.
 
 ### Start go2rtc
 
@@ -425,12 +431,16 @@ The key derivation (`toLowerCase()`, non-alphanum to `_`, strip leading/trailing
 Second, in the `event()` method, find the `if (this.onMotion)` line (inside the `CameraMotion`/`CameraPerson` case) and add this just before it:
 
 ```javascript
-try { require('child_process').execSync('touch /homebridge/nest-snaps/.refresh'); } catch(e) {}
+try { fs_1.default.closeSync(fs_1.default.openSync('/homebridge/nest-snaps/.refresh', 'w')); } catch(e) {}
 ```
 
-This signals the warmer to grab a fresh frame immediately when motion or a person is detected, so the tile shows who's there rather than a stale frame from the last cycle.
+This signals the warmer to grab a fresh frame immediately when motion or a person is detected, so the tile shows who's there rather than a stale frame from the last cycle. (`fs_1` is the plugin's already-imported `fs` module; creating the file is enough — the warmer checks only for its existence, then deletes it. An earlier version shelled out to `execSync('touch …')`, which needlessly blocks Node's event loop on a subprocess; the `fs` call does the same thing without a subshell.)
 
 **Both patches live in `node_modules` and will be wiped by any `npm install` of the plugin.** Save copies outside `node_modules` with a script that re-applies them.
+
+> **Version note — these are whole-file / line-offset patches.** They were written against **homebridge-google-nest-sdm 1.1.23**. The plugin's compiled `dist/` layout moves between releases, so a re-apply script should record the expected version and **refuse to run on a different one** (blindly pasting old files over a newer release can silently revert upstream fixes). Check yours with `node -e "console.log(require('homebridge-google-nest-sdm/package.json').version)"`.
+>
+> **Install order matters.** Do these in sequence, because each later step edits files the earlier one installs: (1) `npm install homebridge-google-nest-sdm`, (2) install [PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) on top of it, (3) *then* apply the snapshot/live-view patches in this guide. Any time you re-run step 1 or 2 (an upgrade), the patches are wiped and must be re-applied last.
 
 ## Part 5: Verify
 
@@ -522,6 +532,8 @@ Source: [developers.google.com/nest/device-access/project/limits](https://develo
 
 Preload costs ~12 `ExtendWebRtcStream` calls/hour/camera — well within the 100 QPH device limit. The warmer makes zero SDM calls (it reads from go2rtc's local cache).
 
+Note that the two limits that matter are scoped differently. The **100 QPH is per camera** (per device instance), so it does *not* get tighter as you add cameras — a warm stream is ~12 extends/hour whether you run 1 camera or 20, and each stays far under its own 100/hour. The one that *is* shared is **`devices.executeCommand` at 10 QPM per project/user**: each stream setup or extend is one command, so bursts matter. In steady state 20 cameras extend ~4 times/minute combined (well under 10 QPM), but if a go2rtc restart re-establishes many streams at once you can momentarily approach the per-minute cap and see a few `429`/`RESOURCE_EXHAUSTED` retries as they stagger out — harmless, and the reason the fork removed the tight inner retry loop (see Part 3) that used to amplify this.
+
 ### Performance (measured on Raspberry Pi 4, arm64)
 
 | Metric | Value |
@@ -539,6 +551,14 @@ Preload costs ~12 `ExtendWebRtcStream` calls/hour/camera — well within the 100
 - [homebridge-google-nest-sdm #215](https://github.com/potmat/homebridge-google-nest-sdm/issues/215) — README corrections (project ID confusion, self-hosted Pub/Sub, Node regression)
 - [homebridge-google-nest-sdm PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) — stream startup latency fix by [@littlepope81](https://github.com/littlepope81)
 
+**Upstream go2rtc work this fork builds on (credit to the authors):**
+
+- [go2rtc PR #2368](https://github.com/AlexxIT/go2rtc/pull/2368) — the Nest keyframe-request + `sprop-parameter-sets`-in-SDP patches from this fork, submitted upstream
+- [go2rtc PR #2351](https://github.com/AlexxIT/go2rtc/pull/2351) by [@tillo](https://github.com/tillo) — loops the Nest stream-extension timer and stops sharing session state between cameras (adopted here; the fork adds transient-error retry on top)
+- [go2rtc PR #2194](https://github.com/AlexxIT/go2rtc/pull/2194) by [@MechanicalCoderX](https://github.com/MechanicalCoderX) — Nest expiry/token/timeout/leak fixes (the ~83-minute HTTP timeout fix is adopted here)
+- [go2rtc PR #2327](https://github.com/AlexxIT/go2rtc/pull/2327) by [@zephleggett](https://github.com/zephleggett) — reap the keyframe consumer on client disconnect (defense-in-depth for the snapshot warmer)
+- [go2rtc PR #2193](https://github.com/AlexxIT/go2rtc/pull/2193) by [@MechanicalCoderX](https://github.com/MechanicalCoderX) — H264/homekit bounds guards against malformed device data
+
 ## License
 
-go2rtc is [MIT licensed](https://github.com/AlexxIT/go2rtc/blob/master/LICENSE). This fork adds a one-line patch to `pkg/nest/client.go`.
+go2rtc is [MIT licensed](https://github.com/AlexxIT/go2rtc/blob/master/LICENSE). This fork carries a small set of Nest-focused patches: IPv4-only ICE in `pkg/nest/client.go`; keyframe-request, `sprop-parameter-sets`, and a stall watchdog in `pkg/webrtc/conn.go`; and stream-extension resilience in `pkg/nest/api.go`. It also incorporates the community PRs credited above. All changes are gated to the Nest source (`FormatName == "nest/webrtc"`) so nothing else in go2rtc is affected.
