@@ -456,6 +456,58 @@ After about 30 seconds:
 
 **Motion notifications not arriving on your phone?** HomeKit defaults motion notifications to **off** for new camera accessories. In the Apple Home app: tap the camera → scroll down → **Status and Notifications** → turn on **Motion Notifications** (and **Activity Notifications** if available). You also need an Apple Home Hub (Apple TV, HomePod, or iPad) for notifications to push when you're away.
 
+## Part 6 (optional): route live view through go2rtc too
+
+By default `homebridge-google-nest-sdm` opens its **own** WebRTC connection to Google every time you tap a camera tile — separate from the warm stream go2rtc is already holding. That means 2–3 concurrent Google streams per camera (go2rtc's preload + each HomeKit view + the Google Home app). Nest enforces a concurrent-stream limit, and hitting it is what causes tiles that hang for many seconds or "never load."
+
+You can make HomeKit live view reuse go2rtc's already-open stream instead, over local RTSP. **Be honest with yourself about what this does:** it does **not** make a single warm camera open faster (RTSP handshake + waiting for a keyframe to start clean stream-copy is ~2–4s, similar to or slightly slower than a direct WebRTC dial). What it buys is **consistency** — one shared Google stream instead of several, so the multi-viewer contention that causes the long hangs goes away. If your only pain was the occasional minute-long hang, this fixes it. If a single camera already opens fine for you, you can skip this.
+
+Two go2rtc patches in this fork make the RTSP path viable for Nest:
+
+- **Keyframe requests** (`pkg/webrtc/conn.go`): go2rtc sends an RTCP keyframe request (PLI) every 2s to the Nest source, so keyframes stay ~2s fresh. Without this, an idle Nest camera stretches its keyframe interval and RTSP consumers wait a long time to start. (This is media-plane RTCP — no SDM API quota cost.)
+- **`sprop-parameter-sets` in the RTSP SDP** (`pkg/webrtc/conn.go`): go2rtc captures the H264 SPS/PPS from the stream and advertises them in the RTSP `DESCRIBE`, so ffmpeg knows the video dimensions immediately and a small `-probesize` is safe.
+
+Both are already in the `go2rtc-nestfix` image you built in Part 3.
+
+Then patch the plugin's `dist/StreamingDelegate.js` `startStream()` — before it calls the SDM streamer, prefer the local RTSP stream when the camera is warm (a fresh snapshot exists), else fall back to the normal Google dial:
+
+```javascript
+// near the top of startStream(), replacing:  const nestStreamer = await getStreamer(...)
+let ffmpegArgs;
+let nestStreamer;
+let nestStream;
+const go2rtcKey = (this.camera.displayName || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+let useGo2rtc = false;
+if (go2rtcKey) {
+    try {
+        const st = require('fs').statSync('/homebridge/nest-snaps/' + go2rtcKey + '.jpg');
+        if (Date.now() - st.mtimeMs < 90000) useGo2rtc = true;   // fresh snapshot == stream is warm
+    } catch (e) {}
+}
+if (useGo2rtc) {
+    ffmpegArgs = '-rtsp_transport tcp -analyzeduration 3000000 -probesize 5000000 -i rtsp://127.0.0.1:8554/' + go2rtcKey;
+} else {
+    nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
+    nestStream = await nestStreamer.initialize();
+    ffmpegArgs = nestStream.args;
+}
+```
+
+Then guard the two places that assumed a streamer object always exists:
+- the FfmpegProcess construction: pass `nestStream ? nestStream.stdin : undefined` (the RTSP path has no stdin pipe; FfmpegProcess already guards `if (stdin)`)
+- `stopStream()`'s teardown: `if (session.streamer) await session.streamer.teardown()`
+
+**One required safety addition.** The go2rtc RTSP input never ends (preload keeps it warm forever), unlike a Google WebRTC stream which self-expires after 5 min. So if HomeKit abandons a session without sending any RTCP, the ffmpeg transcode would run forever. Arm an inactivity watchdog right after the socket binds in `startStream()`:
+
+```javascript
+activeSession.timeout = setTimeout(() => {
+    this.controller.forceStopStreamingSession(request.sessionID);
+    this.stopStream(request.sessionID);
+}, 15000);   // 15s grace for a slow open; the socket 'message' handler replaces it with rtcp_interval*2 on the first RTCP
+```
+
+As with the snapshot patches, these live in `node_modules` and are wiped by any `npm install` — keep them in your re-apply script.
+
 ## Reference
 
 ### SDM API Quotas
