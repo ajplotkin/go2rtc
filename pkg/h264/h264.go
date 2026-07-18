@@ -126,11 +126,19 @@ func GetFmtpLine(avc []byte) string {
 	s := "packetization-mode=1"
 
 	for {
+		// Bounds guards vs malformed device data: need >=4 for the length prefix,
+		// >=5 for NALUType (avc[4]), and size within the buffer for the NAL slice.
+		if len(avc) < 5 {
+			return s
+		}
 		size := 4 + int(binary.BigEndian.Uint32(avc))
+		if size > len(avc) {
+			return s
+		}
 
 		switch NALUType(avc) {
 		case NALUTypeSPS:
-			if len(avc) < 8 || size > len(avc) {
+			if len(avc) < 8 {
 				return s
 			}
 			s += ";profile-level-id=" + hex.EncodeToString(avc[5:8])

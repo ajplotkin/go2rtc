@@ -184,8 +184,10 @@ func (c *RTSPClient) Start() error {
 }
 
 func (c *RTSPClient) Stop() error {
-	c.api.StopRTSPStream()
+	// Stop the extend goroutine first so it can't race StopRTSPStream on the shared
+	// StreamToken/StreamExtensionToken fields (or extend after stop).
 	c.api.StopExtendStreamTimer()
+	c.api.StopRTSPStream()
 	return c.conn.Stop()
 }
 

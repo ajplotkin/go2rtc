@@ -5,6 +5,7 @@ import (
 	"maps"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/probe"
 )
@@ -42,11 +43,39 @@ func AddPreload(name, rawQuery string) error {
 	cons := probe.Create("preload", query)
 
 	if err = stream.AddConsumer(cons); err != nil {
+		// The source may be temporarily unavailable (e.g. a Nest camera powered off at
+		// boot returns 400). Retry in the background so the preload attaches when the
+		// source comes back, instead of staying cold until a restart.
+		go retryPreload(name, rawQuery, query)
 		return err
 	}
 
 	preloads[name] = &Preload{stream: stream, Cons: cons, Query: rawQuery}
 	return nil
+}
+
+func retryPreload(name, rawQuery string, query url.Values) {
+	for {
+		time.Sleep(time.Minute)
+
+		preloadsMu.Lock()
+		if preloads[name] != nil { // a successful AddPreload (or newer retry) already ran
+			preloadsMu.Unlock()
+			return
+		}
+		stream := Get(name)
+		if stream == nil { // stream removed from config
+			preloadsMu.Unlock()
+			return
+		}
+		cons := probe.Create("preload", query)
+		if err := stream.AddConsumer(cons); err == nil {
+			preloads[name] = &Preload{stream: stream, Cons: cons, Query: rawQuery}
+			preloadsMu.Unlock()
+			return
+		}
+		preloadsMu.Unlock()
+	}
 }
 
 func DelPreload(name string) error {

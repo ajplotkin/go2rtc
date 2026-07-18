@@ -413,6 +413,7 @@ func (a *API) StopRTSPStream() error {
 	if err != nil {
 		return err
 	}
+	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
 		return errors.New("nest: wrong status: " + res.Status)
@@ -473,19 +474,39 @@ func (a *API) StartExtendStreamTimer() {
 	a.extendStop = stop
 
 	go func() {
+		// Retry transient extend/refresh failures a few times before giving up, so a single
+		// blip (one 10s timeout, a 429/401) does not permanently stop extension and leave the
+		// session to expire (which stalls the stream). If it truly can't extend, the loop exits
+		// and the stall watchdog in pkg/webrtc reconnects.
+		fails := 0
 		for {
 			select {
 			case <-timer.C:
 				// The OAuth token lives ~1 hour, sessions can live longer
 				if time.Now().After(a.ExpiresAt.Add(-30 * time.Second)) {
 					if err := a.refreshToken(); err != nil {
+						if fails++; fails <= 3 {
+							timer.Reset(15 * time.Second)
+							continue
+						}
 						return
 					}
 				}
 				if err := a.ExtendStream(); err != nil {
+					if fails++; fails <= 3 {
+						timer.Reset(15 * time.Second)
+						continue
+					}
 					return
 				}
-				timer.Reset(time.Until(a.StreamExpiresAt) - time.Minute)
+				fails = 0
+				// Clamp so a zero/past/short expiresAt from Google can't hot-loop ExtendStream
+				// at HTTP-round-trip rate (which would 429 and kill the goroutine).
+				d := time.Until(a.StreamExpiresAt) - time.Minute
+				if d < 30*time.Second {
+					d = 30 * time.Second
+				}
+				timer.Reset(d)
 			case <-stop:
 				return
 			}

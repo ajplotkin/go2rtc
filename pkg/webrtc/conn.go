@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -118,6 +119,35 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			!strings.Contains(codec.FmtpLine, "sprop-parameter-sets=")
 		var spropSPS, spropPPS []byte
 
+		// Patched: stall watchdog for the Nest video track. An expired/quiet Nest WebRTC
+		// session stops delivering media WITHOUT erroring the connection, so producer.go never
+		// reconnects and the stream becomes a zombie (warm but frozen -> HomeKit live view and
+		// snapshots break). If no video RTP arrives for 15s while connected, close the
+		// connection to force a reconnect. With the 2s PLI above, healthy video is never quiet
+		// this long, so 15s is unambiguous.
+		isNestVideo := c.FormatName == "nest/webrtc" && remote.Kind() == webrtc.RTPCodecTypeVideo
+		var lastVideoNS atomic.Int64
+		if isNestVideo {
+			lastVideoNS.Store(time.Now().UnixNano())
+			stallDone := make(chan struct{})
+			defer close(stallDone)
+			go func() {
+				t := time.NewTicker(5 * time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-t.C:
+						if time.Since(time.Unix(0, lastVideoNS.Load())) > 15*time.Second {
+							_ = c.Close() // unblocks remote.Read below -> producer reconnect
+							return
+						}
+					case <-stallDone:
+						return
+					}
+				}
+			}()
+		}
+
 		for {
 			b := make([]byte, ReceiveMTU)
 			n, _, err := remote.Read(b)
@@ -126,6 +156,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 
 			c.Recv += n
+			if isNestVideo {
+				lastVideoNS.Store(time.Now().UnixNano())
+			}
 
 			packet := &rtp.Packet{}
 			if err := packet.Unmarshal(b[:n]); err != nil {
