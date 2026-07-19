@@ -56,25 +56,41 @@ func AddPreload(name, rawQuery string) error {
 
 func retryPreload(name, rawQuery string, query url.Values) {
 	for {
-		time.Sleep(time.Minute)
+		// Gentler than 1 min: each attempt is one GenerateWebRtcStream (SDM executeCommand,
+		// counts against the 100 QPH/camera and shared 10 QPM/project quotas). 2 min keeps a
+		// recovered camera warming reasonably fast without hammering quota while it stays off.
+		time.Sleep(2 * time.Minute)
 
+		// Decide whether we still need to retry, then release the lock BEFORE the network dial
+		// so a 429 backoff inside AddConsumer can't hold preloadsMu (blocking config reload /
+		// consumer attach for this stream for the whole backoff).
 		preloadsMu.Lock()
 		if preloads[name] != nil { // a successful AddPreload (or newer retry) already ran
 			preloadsMu.Unlock()
 			return
 		}
 		stream := Get(name)
+		preloadsMu.Unlock()
 		if stream == nil { // stream removed from config
-			preloadsMu.Unlock()
 			return
 		}
+
 		cons := probe.Create("preload", query)
-		if err := stream.AddConsumer(cons); err == nil {
+		if err := stream.AddConsumer(cons); err != nil {
+			continue // still unavailable; try again next cycle
+		}
+
+		// Dial succeeded — register under lock, but a concurrent AddPreload/retry may have won
+		// while we were dialing; if so, drop our extra consumer instead of leaking it.
+		preloadsMu.Lock()
+		if preloads[name] == nil {
 			preloads[name] = &Preload{stream: stream, Cons: cons, Query: rawQuery}
 			preloadsMu.Unlock()
-			return
+		} else {
+			preloadsMu.Unlock()
+			stream.RemoveConsumer(cons)
 		}
-		preloadsMu.Unlock()
+		return
 	}
 }
 

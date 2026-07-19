@@ -107,6 +107,7 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
 		ts := time.Now()
 		var err error
 		if b, err = ffmpeg.JPEGWithQuery(b, query); err != nil {
+			b = nil // don't cache a failed/partial transcode (ffmpeg can return partial stdout + err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

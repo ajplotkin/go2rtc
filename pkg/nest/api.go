@@ -30,6 +30,7 @@ type API struct {
 
 	extendTimer *time.Timer
 	extendStop  chan struct{}
+	extendDone  chan struct{}
 }
 
 type Auth struct {
@@ -470,10 +471,13 @@ func (a *API) StartExtendStreamTimer() {
 	// returns a new expiresAt, so keep extending until the stream stops.
 	timer := time.NewTimer(time.Until(a.StreamExpiresAt) - time.Minute)
 	stop := make(chan struct{})
+	done := make(chan struct{})
 	a.extendTimer = timer
 	a.extendStop = stop
+	a.extendDone = done
 
 	go func() {
+		defer close(done)
 		// Retry transient extend/refresh failures a few times before giving up, so a single
 		// blip (one 10s timeout, a 429/401) does not permanently stop extension and leave the
 		// session to expire (which stalls the stream). If it truly can't extend, the loop exits
@@ -515,12 +519,19 @@ func (a *API) StartExtendStreamTimer() {
 }
 
 func (a *API) StopExtendStreamTimer() {
+	if a.extendStop != nil {
+		close(a.extendStop)
+		a.extendStop = nil
+	}
 	if a.extendTimer != nil {
 		a.extendTimer.Stop()
 		a.extendTimer = nil
 	}
-	if a.extendStop != nil {
-		close(a.extendStop)
-		a.extendStop = nil
+	// Wait for the goroutine to actually exit before returning, so a caller (RTSPClient.Stop)
+	// can't race an in-flight ExtendStream writing StreamToken/StreamExtensionToken against
+	// StopRTSPStream clearing them. Bounded by the 10s HTTP client timeout.
+	if a.extendDone != nil {
+		<-a.extendDone
+		a.extendDone = nil
 	}
 }

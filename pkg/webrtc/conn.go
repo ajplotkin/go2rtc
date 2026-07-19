@@ -38,6 +38,13 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		pc: pc,
 	}
 
+	// Patched (Nest): set true once the Nest video track delivers its first RTP packet.
+	// Shared between OnTrack (setter) and OnConnectionStateChange (the connect watchdog reader)
+	// via closure capture. The per-track stall watchdog inside OnTrack only arms after the
+	// first packet; this covers the "connected but no video RTP ever" zombie, which OnTrack
+	// would never see.
+	var nestVideoSeen atomic.Bool
+
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		// last candidate will be empty
 		if candidate != nil {
@@ -136,6 +143,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		isNestVideo := c.FormatName == "nest/webrtc" && remote.Kind() == webrtc.RTPCodecTypeVideo
 		var lastVideoNS atomic.Int64
 		if isNestVideo {
+			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 			lastVideoNS.Store(time.Now().UnixNano())
 			stallDone := make(chan struct{})
 			defer close(stallDone)
@@ -233,6 +241,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		case webrtc.PeerConnectionStateConnected:
 			for _, sender := range c.Senders {
 				sender.Start()
+			}
+			// Patched (Nest): connect watchdog for the "connected but no video RTP ever" zombie.
+			// OnTrack (and its per-track stall watchdog) only fire once media arrives; a session
+			// that reaches connected but never delivers a video packet would otherwise sit warm
+			// forever with no reconnect. If no Nest video track has been seen 30s after connect,
+			// close so producer.go reconnects. Gated on FormatName so only Nest is affected.
+			if c.FormatName == "nest/webrtc" {
+				go func() {
+					time.Sleep(30 * time.Second)
+					if !nestVideoSeen.Load() {
+						_ = c.Close()
+					}
+				}()
 			}
 		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			// disconnect event comes earlier, than failed

@@ -132,7 +132,9 @@ func GetFmtpLine(avc []byte) string {
 			return s
 		}
 		size := 4 + int(binary.BigEndian.Uint32(avc))
-		if size > len(avc) {
+		// size < 5 guards a huge length that overflows int on 32-bit builds (wraps
+		// negative, else avc[4:size] would panic); size > len(avc) guards truncation.
+		if size < 5 || size > len(avc) {
 			return s
 		}
 
