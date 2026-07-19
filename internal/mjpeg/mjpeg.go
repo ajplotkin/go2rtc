@@ -98,8 +98,8 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
 	b = once.Buffer()
 
 	if ctx.Err() != nil {
-		b = nil     // don't let a partial/raw buffer get cached (cache defer stores non-nil b)
-		return      // client gone before a keyframe arrived
+		b = nil // don't let a partial/raw buffer get cached (cache defer stores non-nil b)
+		return  // client gone before a keyframe arrived
 	}
 
 	switch cons.CodecName() {
