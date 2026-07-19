@@ -1,5 +1,10 @@
 # Google Nest Cameras in Apple HomeKit — With Real Tile Images
 
+> **📖 The maintained, canonical version of this guide — with the helper scripts, an
+> `install.sh`, a Docker Compose file, and the plugin patches — lives in its own repo:
+> [github.com/ajplotkin/nest-homekit-snapshots](https://github.com/ajplotkin/nest-homekit-snapshots).**
+> This copy inside the go2rtc fork may lag behind it. Start there.
+
 You have Google Nest cameras. You want them in Apple HomeKit. And you want to actually *see* what the camera sees on the tile — a real, refreshing image — not a blank tile or a placeholder logo.
 
 This is harder than it should be. Google does not offer Nest cameras through HomeKit natively, and when they migrated Nest devices to the Google Home app, they removed the API that provided still images. No integration — commercial or open-source — can request a snapshot from these cameras anymore. The only way to get a real picture is to grab a frame from a live video stream.
