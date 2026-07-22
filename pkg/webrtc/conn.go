@@ -14,7 +14,12 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+	zlog "github.com/rs/zerolog/log"
 )
+
+// nestConnSeq gives each Nest producer OnTrack a small unique id so the [nestdbg] logs can be
+// grouped per camera-session — Nest assigns SSRC 7777 to every camera, so SSRC can't distinguish them.
+var nestConnSeq atomic.Int64
 
 type Conn struct {
 	core.Connection
@@ -98,6 +103,24 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 		}
 
+		// Nest drought-recovery state, shared by the PLI ticker and the stall watchdog below.
+		// A Nest camera stops sending keyframes (sometimes all RTP) for ~12-24s while it processes
+		// its own event clip after motion; established consumers then can't decode. The camera
+		// ignores in-band keyframe requests (FIR) during this window, so recovery is a close/re-dial
+		// (a REPLACEMENT session, not an addition), which opens with a fresh IDR.
+		//
+		// isNestVideoTrack = "a Nest video track arrived" (codec-irrelevant); it only gates
+		// nestVideoSeen for the connect watchdog. isNestVideo additionally requires H264 and gates the
+		// drought logic (read-loop keyframe/timestamp updates + the stall watchdog), because
+		// isRTPKeyframe parses H264 NAL types and would misparse a non-H264 track. Keeping the two
+		// separate avoids the connect watchdog killing a healthy non-H264 stream every 30s.
+		isNestVideoTrack := c.FormatName == "nest/webrtc" && remote.Kind() == webrtc.RTPCodecTypeVideo
+		isNestVideo := isNestVideoTrack && codec.Name == core.CodecH264
+		if isNestVideoTrack {
+			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
+		}
+		var lastVideoNS, lastIDRNS atomic.Int64
+
 		// Patched: also request periodic keyframes for the Nest source (ModeActiveProducer,
 		// FormatName "nest/webrtc"). Upstream only does this for PassiveProducer (WHIP/browser
 		// push). Gating on FormatName (not the mode) avoids forcing 2s IDRs on other
@@ -105,10 +128,16 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// Keeps keyframes ~2s fresh so RTSP consumers (Homebridge live view) start fast.
 		if (c.Mode == core.ModePassiveProducer || c.FormatName == "nest/webrtc") && remote.Kind() == webrtc.RTPCodecTypeVideo {
 			go func() {
-				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
+				ssrc := uint32(remote.SSRC())
 				t := time.NewTicker(time.Second * 2)
 				defer t.Stop()
 				for range t.C {
+					// Plain PLI. FIR escalation was removed: production traces (2026-07-22 17:12 UTC
+					// drought) show Nest IGNORES FIR during its post-motion upload window — idr_age
+					// climbed past 11s while FIR was sent 5 times. The only thing that ends the
+					// drought is a fresh session (the re-dial in the watchdog below), so there is no
+					// point spending RTCP on an in-band keyframe request the camera won't honor.
+					pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: ssrc}}
 					if err := pc.WriteRTCP(pkts); err != nil {
 						return
 					}
@@ -134,27 +163,55 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			!strings.Contains(codec.FmtpLine, "sprop-parameter-sets=")
 		var spropSPS, spropPPS []byte
 
-		// Patched: stall watchdog for the Nest video track. An expired/quiet Nest WebRTC
-		// session stops delivering media WITHOUT erroring the connection, so producer.go never
-		// reconnects and the stream becomes a zombie (warm but frozen -> HomeKit live view and
-		// snapshots break). If no video RTP arrives for 15s while connected, close the
-		// connection to force a reconnect. With the 2s PLI above, healthy video is never quiet
-		// this long, so 15s is unambiguous.
-		isNestVideo := c.FormatName == "nest/webrtc" && remote.Kind() == webrtc.RTPCodecTypeVideo
-		var lastVideoNS atomic.Int64
+		// Patched: stall watchdog for the Nest video track. An expired/quiet Nest WebRTC session
+		// stops delivering media WITHOUT erroring the connection, so producer.go never reconnects
+		// and the stream becomes a zombie (warm but frozen). Two triggers, both -> close, which makes
+		// producer.go re-dial a fresh session (a REPLACEMENT: the old pc is closed here first):
+		//   - no real video RTP at all for 8s (full stall), or
+		//   - real video flows but no keyframe for 4s (the post-motion upload drought).
+		// A fresh session is the ONLY thing that ends a drought: Nest withholds video ~12-24s after a
+		// motion event and IGNORES FIR (verified 2026-07-22 17:12 UTC: idr_age climbed past 11s while
+		// FIR was sent 5x), but a re-dialed session opens with an IDR and recovers in ~2-4s. The
+		// keyframe trigger is 4s (down from 8s) so that fresh IDR reaches an in-progress HKSV recording
+		// well under the Apple hub's ~16-23s record deadline. Healthy video keeps a keyframe every ~2s
+		// (2s PLI), so idr_age >4s means a real drought, not jitter. connID distinguishes cameras in
+		// the logs — Nest assigns SSRC 7777 to every camera, so SSRC can't tell them apart.
 		if isNestVideo {
-			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
-			lastVideoNS.Store(time.Now().UnixNano())
+			now := time.Now().UnixNano()
+			lastVideoNS.Store(now)
+			lastIDRNS.Store(now)
+			connID := nestConnSeq.Add(1)
+			zlog.Info().Int64("conn", connID).Msg("[nestdbg] drought-watchdog armed")
 			stallDone := make(chan struct{})
 			defer close(stallDone)
 			go func() {
-				t := time.NewTicker(5 * time.Second)
+				t := time.NewTicker(time.Second)
 				defer t.Stop()
 				for {
 					select {
 					case <-t.C:
-						if time.Since(time.Unix(0, lastVideoNS.Load())) > 15*time.Second {
-							_ = c.Close() // unblocks remote.Read below -> producer reconnect
+						videoAge := time.Since(time.Unix(0, lastVideoNS.Load()))
+						idrAge := time.Since(time.Unix(0, lastIDRNS.Load()))
+						if videoAge > 3*time.Second || idrAge > 3*time.Second {
+							zlog.Info().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("[nestdbg] watchdog tick (drought?)")
+						}
+						// Keyframe drought: real video is still flowing (recent RTP) but no keyframe
+						// for 4s — the post-motion upload window. Re-dial for a fresh IDR. Gated on
+						// videoAge because lastIDRNS <= lastVideoNS always (a keyframe IS a video
+						// packet), so idrAge >= videoAge; without the videoAge guard this fast trigger
+						// would shadow the full-stall branch below and turn a mere 5s network blip into
+						// a teardown. "Video flowing, no keyframe" is the signature we actually want.
+						if videoAge <= 4*time.Second && idrAge > 4*time.Second {
+							zlog.Info().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("[nestdbg] STALL CLOSE: no keyframe")
+							_ = c.Close()
+							return
+						}
+						// Full RTP stall: no real video at all for 8s (dead session / sustained
+						// outage). More tolerant than the keyframe path — this is a network event,
+						// not a Nest drought, and the re-dial can't help until connectivity returns.
+						if videoAge > 8*time.Second {
+							zlog.Info().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("[nestdbg] STALL CLOSE: no video RTP")
+							_ = c.Close()
 							return
 						}
 					case <-stallDone:
@@ -172,9 +229,6 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 
 			c.Recv += n
-			if isNestVideo {
-				lastVideoNS.Store(time.Now().UnixNano())
-			}
 
 			packet := &rtp.Packet{}
 			if err := packet.Unmarshal(b[:n]); err != nil {
@@ -182,7 +236,17 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 
 			if len(packet.Payload) == 0 {
+				// WebRTC padding / bandwidth-probe packet: not real media. Must NOT refresh
+				// lastVideoNS, or a camera that keeps probing through a drought would keep the
+				// "no video RTP" watchdog from ever firing.
 				continue
+			}
+
+			if isNestVideo {
+				lastVideoNS.Store(time.Now().UnixNano())
+				if isRTPKeyframe(packet.Payload) {
+					lastIDRNS.Store(time.Now().UnixNano())
+				}
 			}
 
 			if captureSprop {
@@ -263,6 +327,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 	})
 
 	return c
+}
+
+// isRTPKeyframe reports whether an RTP H264 payload begins or contains an IDR NAL.
+// Handles single NAL (type 5), STAP-A (24, bundled), and FU-A (28) start fragments.
+// h264.IsKeyframe expects AVCC (length-prefixed), not RTP payloads, so detect here.
+func isRTPKeyframe(pl []byte) bool {
+	if len(pl) == 0 {
+		return false
+	}
+	switch pl[0] & 0x1F {
+	case h264.NALUTypeIFrame: // 5: single-NAL IDR
+		return true
+	case 24: // STAP-A: walk bundled NALs
+		for b := pl[1:]; len(b) >= 2; {
+			sz := int(binary.BigEndian.Uint16(b))
+			b = b[2:]
+			if sz < 1 || sz > len(b) {
+				break
+			}
+			if b[0]&0x1F == h264.NALUTypeIFrame {
+				return true
+			}
+			b = b[sz:]
+		}
+	case 28: // FU-A: start fragment of an IDR
+		return len(pl) >= 2 && pl[1]&0x80 != 0 && pl[1]&0x1F == h264.NALUTypeIFrame
+	}
+	return false
 }
 
 func (c *Conn) MarshalJSON() ([]byte, error) {
