@@ -133,6 +133,7 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 
 	offer, err := conn.CreateCompleteOffer(medias)
 	if err != nil {
+		_ = pc.Close()
 		return nil, err
 	}
 
@@ -142,10 +143,17 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 	// consumers. Let producer.go's outer reconnect handle backoff instead.
 	answer, err := nestAPI.ExchangeSDP(projectID, deviceID, offer)
 	if err != nil {
+		// Close the failed PeerConnection: it never reaches ICE connectivity
+		// (no answer is set), so pion's connection-state auto-close never fires
+		// and its ICE agent's mDNS socket (:5353) leaks on every failed dial.
+		// An off camera returning 400 every ~2 min otherwise accumulates sockets
+		// until host mDNS breaks. See AlexxIT/go2rtc#2378.
+		_ = pc.Close()
 		return nil, err
 	}
 
 	if err = conn.SetAnswer(answer); err != nil {
+		_ = pc.Close()
 		return nil, err
 	}
 
@@ -163,6 +171,7 @@ func rtspConn(nestAPI *API, rawURL, projectID, deviceID string) (*RTSPClient, er
 		return nil, err
 	}
 	if err := rtspClient.Describe(); err != nil {
+		_ = rtspClient.Close()
 		return nil, err
 	}
 
