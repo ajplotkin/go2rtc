@@ -2,6 +2,7 @@ package ffmpeg
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/url"
 	"os/exec"
@@ -27,7 +28,31 @@ func transcode(b []byte, args string) ([]byte, error) {
 	cmdArgs := shell.QuoteSplit(args)
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
 	cmd.Stdin = bytes.NewBuffer(b)
-	return cmd.Output()
+
+	out, err := cmd.Output()
+	if err != nil {
+		// cmd.Output captures stderr into ExitError.Stderr, but callers only see
+		// err.Error() ("exit status N"), so FFmpeg's diagnostic is lost. Attach it.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+			err = fmt.Errorf("%w: %s", err, tailStderr(exitErr.Stderr))
+		}
+		return nil, err
+	}
+	return out, nil
+}
+
+// maxStderr bounds how much FFmpeg output is attached to an error; the string can
+// reach an HTTP body, and log.ffmpeg=debug makes the output unbounded.
+const maxStderr = 1024
+
+// tailStderr returns the last maxStderr bytes, where FFmpeg's failure reason sits.
+func tailStderr(b []byte) []byte {
+	b = bytes.TrimSpace(b)
+	if len(b) > maxStderr {
+		return append([]byte("..."), b[len(b)-maxStderr:]...)
+	}
+	return b
 }
 
 func defaultArgs() *ffmpeg.Args {

@@ -108,6 +108,8 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
 		var err error
 		if b, err = ffmpeg.JPEGWithQuery(b, query); err != nil {
 			b = nil // don't cache a failed/partial transcode (ffmpeg can return partial stdout + err)
+			// the 500 body is often swallowed by the client (e.g. curl -sf), so log it
+			log.Error().Err(err).Str("src", query.Get("src")).Msg("[mjpeg] transcode keyframe")
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
