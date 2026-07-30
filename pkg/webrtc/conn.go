@@ -17,7 +17,7 @@ import (
 	zlog "github.com/rs/zerolog/log"
 )
 
-// nestConnSeq gives each Nest producer OnTrack a small unique id so the [nestdbg] logs can be
+// nestConnSeq gives each Nest producer OnTrack a small unique id so the stall-watchdog logs can be
 // grouped per camera-session — Nest assigns SSRC 7777 to every camera, so SSRC can't distinguish them.
 var nestConnSeq atomic.Int64
 
@@ -181,7 +181,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			lastVideoNS.Store(now)
 			lastIDRNS.Store(now)
 			connID := nestConnSeq.Add(1)
-			zlog.Info().Int64("conn", connID).Msg("[nestdbg] drought-watchdog armed")
+			zlog.Debug().Int64("conn", connID).Msg("nest: stall watchdog armed")
 			stallDone := make(chan struct{})
 			defer close(stallDone)
 			go func() {
@@ -193,7 +193,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 						videoAge := time.Since(time.Unix(0, lastVideoNS.Load()))
 						idrAge := time.Since(time.Unix(0, lastIDRNS.Load()))
 						if videoAge > 3*time.Second || idrAge > 3*time.Second {
-							zlog.Info().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("[nestdbg] watchdog tick (drought?)")
+							zlog.Debug().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("nest: no recent video/keyframe")
 						}
 						// Keyframe drought: real video is still flowing (recent RTP) but no keyframe
 						// for 4s — the post-motion upload window. Re-dial for a fresh IDR. Gated on
@@ -202,7 +202,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 						// would shadow the full-stall branch below and turn a mere 5s network blip into
 						// a teardown. "Video flowing, no keyframe" is the signature we actually want.
 						if videoAge <= 4*time.Second && idrAge > 4*time.Second {
-							zlog.Info().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("[nestdbg] STALL CLOSE: no keyframe")
+							zlog.Warn().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("nest: closing stalled stream (no keyframe)")
 							_ = c.Close()
 							return
 						}
@@ -210,7 +210,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 						// outage). More tolerant than the keyframe path — this is a network event,
 						// not a Nest drought, and the re-dial can't help until connectivity returns.
 						if videoAge > 8*time.Second {
-							zlog.Info().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("[nestdbg] STALL CLOSE: no video RTP")
+							zlog.Warn().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("nest: closing stalled stream (no video RTP)")
 							_ = c.Close()
 							return
 						}
