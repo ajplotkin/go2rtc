@@ -90,6 +90,36 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			return
 		}
 
+		// Adopt the transmitted codec into a receiver a consumer is already on, so the
+		// GetTrack below (Conn.GetTrack, pkg/webrtc/producer.go:8 -- it shadows
+		// core.Connection.GetTrack) finds it by pointer identity instead of minting a second
+		// receiver.
+		//
+		// getMediaCodec resolves `codec` from the payload type actually being transmitted, but
+		// media.Codecs is narrowed to that entry only BELOW. A consumer that wired up earlier
+		// matched the FIRST codec in the answer, which for Nest need not be the transmitted
+		// one -- so OnTrack ends up feeding a receiver with no consumers while the consumer
+		// sits on one that never receives. Observed live: receiver A childs=true bytes=0
+		// profile=<nil> beside receiver B childs=false bytes=3546841 profile=Main. Audio is
+		// unaffected (single Opus payload type), which is why it is so quiet: ffmpeg keeps
+		// reading audio so its socket timeout never fires, and frag_keyframe cannot cut a
+		// fragment without video keyframes.
+		//
+		// Deliberately not the reverse (moving senders onto the new receiver): that receiver is
+		// absent from Producer.receivers, so stopProducers would see no attached senders and
+		// stop a producer that still has live consumers.
+		//
+		// Gated to Nest to bound the blast radius here; the pointer-vs-value mismatch is
+		// generic to any producer whose answer keeps several codecs on one media.
+		if c.FormatName == "nest/webrtc" {
+			for _, recv := range c.Receivers {
+				if recv.Media == media && recv.Codec != codec && recv.Codec.Match(codec) {
+					recv.Codec = codec
+					break
+				}
+			}
+		}
+
 		track, err := c.GetTrack(media, codec)
 		if err != nil {
 			return
