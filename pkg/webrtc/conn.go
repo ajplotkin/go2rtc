@@ -225,13 +225,12 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 						if videoAge > 3*time.Second || idrAge > 3*time.Second {
 							zlog.Debug().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("nest: no recent video/keyframe")
 						}
-						// Keyframe drought: real video is still flowing (recent RTP) but no keyframe
-						// for 4s — the post-motion upload window. Re-dial for a fresh IDR. Gated on
+						// Permanently dry session: video still flowing but no keyframe for 60s. Gated on
 						// videoAge because lastIDRNS <= lastVideoNS always (a keyframe IS a video
 						// packet), so idrAge >= videoAge; without the videoAge guard this fast trigger
 						// would shadow the full-stall branch below and turn a mere 5s network blip into
 						// a teardown. "Video flowing, no keyframe" is the signature we actually want.
-						if videoAge <= 4*time.Second && idrAge > 4*time.Second {
+						if videoAge <= 8*time.Second && idrAge > 60*time.Second {
 							zlog.Warn().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("nest: closing stalled stream (no keyframe)")
 							_ = c.Close()
 							return

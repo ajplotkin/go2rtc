@@ -168,6 +168,17 @@ func (p *Producer) worker(conn core.Producer, workerID int) {
 		}
 
 		log.Warn().Err(err).Str("url", p.url).Caller().Send()
+	} else {
+		// Patched: a nil return means the producer ended WITHOUT an error -- the remote closed
+		// the session cleanly, or an internal path called Close(). Only the error branch above
+		// logs anything, so that case is completely silent: the next line in the log is
+		// `retry=0`, with no record of what ended the session. Every "my stream drops every N
+		// minutes" report is unfalsifiable for exactly this reason.
+		//
+		// Observed here 1-3x/day on a Nest source with no accompanying error anywhere, and one
+		// of those silent swaps re-dialled mid-session, splicing fresh RTP into a still-open
+		// consumer and costing a real doorbell recording (2026-08-03 04:26 EDT).
+		log.Debug().Str("url", p.url).Msg("[streams] producer ended without error")
 	}
 
 	p.reconnect(workerID, 0)
