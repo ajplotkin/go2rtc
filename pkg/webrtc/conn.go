@@ -87,10 +87,22 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 		}
 
-		if c.Mode == core.ModePassiveProducer && remote.Kind() == webrtc.RTPCodecTypeVideo {
+		// TEST BUILD A -- PLI only, extended to active (dialed) producers.
+		// Upstream sends a 2s PLI for passive producers (browser/WHIP push) only, so dialed
+		// sources such as nest: never request keyframes at all. This sends PLI and nothing
+		// else, at 5s for active producers, so a comparison against build B isolates FIR as
+		// the single variable. No other change from v1.9.14.
+		if remote.Kind() == webrtc.RTPCodecTypeVideo &&
+			(c.Mode == core.ModePassiveProducer || c.Mode == core.ModeActiveProducer) {
+			interval := 2 * time.Second
+			if c.Mode == core.ModeActiveProducer {
+				interval = 5 * time.Second
+			}
 			go func() {
 				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
-				for range time.NewTicker(time.Second * 2).C {
+				t := time.NewTicker(interval)
+				defer t.Stop()
+				for range t.C {
 					if err := pc.WriteRTCP(pkts); err != nil {
 						return
 					}
