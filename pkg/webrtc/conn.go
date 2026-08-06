@@ -87,10 +87,30 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 		}
 
-		if c.Mode == core.ModePassiveProducer && remote.Kind() == webrtc.RTPCodecTypeVideo {
+		// TEST BUILD B -- PLI + FIR, per @benholtz's proposal in go2rtc#2365, verbatim in
+		// substance. Identical to build A except each tick also sends a FullIntraRequest with
+		// an incrementing sequence number (RFC 5104) so repeats are not deduplicated.
+		// FIR is the single variable between A and B. No other change from v1.9.14.
+		if remote.Kind() == webrtc.RTPCodecTypeVideo &&
+			(c.Mode == core.ModePassiveProducer || c.Mode == core.ModeActiveProducer) {
+			interval := 2 * time.Second
+			if c.Mode == core.ModeActiveProducer {
+				interval = 5 * time.Second
+			}
 			go func() {
-				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
-				for range time.NewTicker(time.Second * 2).C {
+				mediaSSRC := uint32(remote.SSRC())
+				var firSeq uint8
+				t := time.NewTicker(interval)
+				defer t.Stop()
+				for range t.C {
+					firSeq++
+					pkts := []rtcp.Packet{
+						&rtcp.PictureLossIndication{MediaSSRC: mediaSSRC},
+						&rtcp.FullIntraRequest{
+							MediaSSRC: mediaSSRC,
+							FIR:       []rtcp.FIREntry{{SSRC: mediaSSRC, SequenceNumber: firSeq}},
+						},
+					}
 					if err := pc.WriteRTCP(pkts); err != nil {
 						return
 					}
