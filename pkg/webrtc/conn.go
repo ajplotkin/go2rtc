@@ -198,13 +198,18 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// and the stream becomes a zombie (warm but frozen). Two triggers, both -> close, which makes
 		// producer.go re-dial a fresh session (a REPLACEMENT: the old pc is closed here first):
 		//   - no real video RTP at all for 8s (full stall), or
-		//   - real video flows but no keyframe for 4s (the post-motion upload drought).
+		//   - real video flows but no keyframe for 60s (a session gone permanently dry).
 		// A fresh session is the ONLY thing that ends a drought: Nest withholds video ~12-24s after a
 		// motion event and IGNORES FIR (verified 2026-07-22 17:12 UTC: idr_age climbed past 11s while
-		// FIR was sent 5x), but a re-dialed session opens with an IDR and recovers in ~2-4s. The
-		// keyframe trigger is 4s (down from 8s) so that fresh IDR reaches an in-progress HKSV recording
-		// well under the Apple hub's ~16-23s record deadline. Healthy video keeps a keyframe every ~2s
-		// (2s PLI), so idr_age >4s means a real drought, not jitter. connID distinguishes cameras in
+		// FIR was sent 5x), but a re-dialed session opens with an IDR and recovers in ~2-4s.
+		//
+		// The keyframe deadline was 4s and that was WRONG. Measured over 48h (2026-08-03/04): it fired
+		// 23 times, and 13 of those killed a session whose video had arrived under 2s earlier (median
+		// 1.28s, several at 40-120ms). Healthy Nest video jitters keyframes into the 3-4s range
+		// routinely, so a 4s deadline sits inside the tail of NORMAL behaviour — and every kill forces
+		// a re-dial, which splices fresh RTP into any still-open consumer session. It was manufacturing
+		// the hazard it was meant to guard against, and it censored every drought measurement at 4s.
+		// At 60s it fires only on a session that is never coming back. connID distinguishes cameras in
 		// the logs — Nest assigns SSRC 7777 to every camera, so SSRC can't tell them apart.
 		if isNestVideo {
 			now := time.Now().UnixNano()
