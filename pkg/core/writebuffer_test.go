@@ -33,6 +33,34 @@ func TestWriteBufferCloseUnblocksWriteTo(t *testing.T) {
 	}
 }
 
+// countingWriter records whether it was ever written to. Deliberately NOT an
+// io.Closer, so Close() takes the same path the HTTP consumer path takes.
+type countingWriter struct{ writes int }
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.writes++
+	return len(p), nil
+}
+
+// A Write arriving after Close must be rejected and must NOT reach the underlying
+// writer. On the HTTP path that writer is net/http's bufio.Writer, which is recycled
+// into the server pool once the handler returns — writing into it then corrupts an
+// unrelated request's buffer, which is the panic behind upstream #338/#1220/#1261/#1757.
+//
+// Close previously set only `closed`, while Write gates solely on `err`, so this was
+// reachable. Reverting the err-on-close lines in Close() makes this test fail; the two
+// tests above pass either way, which is why this one exists.
+func TestWriteBufferWriteAfterCloseDoesNotReachWriter(t *testing.T) {
+	cw := &countingWriter{}
+	wb := NewWriteBuffer(cw)
+
+	require.NoError(t, wb.Close())
+
+	_, err := wb.Write([]byte("late"))
+	require.Error(t, err, "Write after Close must return an error")
+	require.Zero(t, cw.writes, "Write after Close reached the underlying writer")
+}
+
 // Close before WriteTo registers its wait must not block WriteTo forever.
 func TestWriteBufferCloseBeforeWriteTo(t *testing.T) {
 	wb := NewWriteBuffer(nil)

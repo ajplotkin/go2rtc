@@ -54,10 +54,32 @@ func (w *WriteBuffer) Close() error {
 	w.mu.Unlock()
 
 	if closer, ok := writer.(io.Closer); ok {
+		// Mark closed on this path too. Returning early left err nil, so a later Write
+		// had nothing to reject on -- same hazard as below.
+		w.mu.Lock()
+		w.closed = true
+		if w.err == nil {
+			w.err = io.ErrClosedPipe
+		}
+		w.mu.Unlock()
 		return closer.Close()
 	}
 	w.mu.Lock()
 	w.closed = true
+	// Set err, not merely closed. Write() gates on `w.err != nil` and nothing else, so
+	// before this a write arriving after Close() went straight through to
+	// w.Writer.Write() -- and on the HTTP path that Writer is net/http's bufio.Writer,
+	// which is RECYCLED into the server's pool once the handler returns. Writing into a
+	// pooled buffer now owned by an unrelated request is the cause behind the
+	// long-running panic reports upstream (#338, #1220, #1261, #1757); this mirrors
+	// upstream PR #2339 (Color-Kat).
+	//
+	// Worth stating plainly: a panic here takes down the go2rtc process, i.e. every
+	// camera at once. On this deployment that is a whole-stack outage, not one dropped
+	// consumer.
+	if w.err == nil {
+		w.err = io.ErrClosedPipe
+	}
 	w.done()
 	w.mu.Unlock()
 	return nil

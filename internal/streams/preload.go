@@ -19,6 +19,31 @@ type Preload struct {
 var preloads = map[string]*Preload{}
 var preloadsMu sync.Mutex
 
+// In-flight retry goroutines, name -> cancel channel. Guarded by preloadsMu.
+//
+// Without this the retry loop was fire-and-forget: it exited only once a preload
+// existed for the name or the stream vanished from config. Two consequences, both
+// observed as possible by inspection rather than in production here, where preloads
+// come only from boot config:
+//   - DelPreload on a preload that had never successfully attached returned "not
+//     found" and left the goroutine running, so when the camera came back it
+//     re-registered the preload the operator had just deleted.
+//   - Every failing AddPreload spawned another goroutine, each dialing SDM on its own
+//     2-minute cadence against the same quota, until one happened to succeed.
+var preloadRetries = map[string]chan struct{}{}
+
+// cancelRetryLocked stops any in-flight retry for name. preloadsMu must be held.
+// The canceller closes the channel and removes the entry; the goroutine only ever
+// reads from it, so there is exactly one closer and no double-close.
+func cancelRetryLocked(name string) bool {
+	if stop, ok := preloadRetries[name]; ok {
+		close(stop)
+		delete(preloadRetries, name)
+		return true
+	}
+	return false
+}
+
 func AddPreload(name, rawQuery string) error {
 	if rawQuery == "" {
 		rawQuery = "video&audio"
@@ -46,20 +71,49 @@ func AddPreload(name, rawQuery string) error {
 		// The source may be temporarily unavailable (e.g. a Nest camera powered off at
 		// boot returns 400). Retry in the background so the preload attaches when the
 		// source comes back, instead of staying cold until a restart.
-		go retryPreload(name, rawQuery, query)
+		//
+		// Single-flight: only one retry goroutine per name, or repeated AddPreload calls
+		// each add another dialer against the same SDM quota.
+		if _, busy := preloadRetries[name]; !busy {
+			stop := make(chan struct{})
+			preloadRetries[name] = stop
+			go retryPreload(name, rawQuery, query, stop)
+		}
 		return err
 	}
+
+	// Attached directly, so any retry for this name is now redundant. It would exit on
+	// its own next wake, but cancelling frees it (and its timer) immediately.
+	cancelRetryLocked(name)
 
 	preloads[name] = &Preload{stream: stream, Cons: cons, Query: rawQuery}
 	return nil
 }
 
-func retryPreload(name, rawQuery string, query url.Values) {
+func retryPreload(name, rawQuery string, query url.Values, stop chan struct{}) {
+	// Deregister on every exit path so a later AddPreload can start a fresh retry --
+	// but only if the map still points at OUR channel, since a canceller may already
+	// have removed us and a newer goroutine taken the slot.
+	defer func() {
+		preloadsMu.Lock()
+		if preloadRetries[name] == stop {
+			delete(preloadRetries, name)
+		}
+		preloadsMu.Unlock()
+	}()
+
 	for {
 		// Gentler than 1 min: each attempt is one GenerateWebRtcStream (SDM executeCommand,
 		// counts against the 100 QPH/camera and shared 10 QPM/project quotas). 2 min keeps a
 		// recovered camera warming reasonably fast without hammering quota while it stays off.
-		time.Sleep(2 * time.Minute)
+		//
+		// Waited on alongside stop so DelPreload takes effect immediately rather than up to
+		// two minutes later, and so a cancelled retry cannot dial once more on its way out.
+		select {
+		case <-stop:
+			return
+		case <-time.After(2 * time.Minute):
+		}
 
 		// Decide whether we still need to retry, then release the lock BEFORE the network dial
 		// so a 429 backoff inside AddConsumer can't hold preloadsMu (blocking config reload /
@@ -98,9 +152,20 @@ func DelPreload(name string) error {
 	preloadsMu.Lock()
 	defer preloadsMu.Unlock()
 
+	// Cancel an in-flight retry as well as removing any attached preload. A preload that
+	// has never successfully attached exists ONLY as a retry goroutine, so without this
+	// DelPreload reported "not found" and left it running -- and it would re-register the
+	// preload the operator had just deleted as soon as the source came back.
+	cancelled := cancelRetryLocked(name)
+
 	if p := preloads[name]; p != nil {
 		p.stream.RemoveConsumer(p.Cons)
 		delete(preloads, name)
+		return nil
+	}
+
+	// Cancelling a pending retry is a real deletion, not a miss.
+	if cancelled {
 		return nil
 	}
 
