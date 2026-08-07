@@ -134,10 +134,22 @@ func retryPreload(name, rawQuery string, query url.Values, stop chan struct{}) {
 			continue // still unavailable; try again next cycle
 		}
 
-		// Dial succeeded — register under lock, but a concurrent AddPreload/retry may have won
-		// while we were dialing; if so, drop our extra consumer instead of leaking it.
+		// Dial succeeded. Two reasons not to register, both checked under the lock:
+		//
+		//  1. We were CANCELLED while dialing. The select above only covers cancellation
+		//     that arrives while waiting; a dial takes seconds (much longer behind a 429
+		//     backoff), and DelPreload during that window deletes preloads[name] — so the
+		//     `preloads[name] == nil` test alone reads as "free to register" and puts back
+		//     exactly the preload the operator just deleted. That resurrection is the bug
+		//     this whole cancel mechanism exists to prevent, so testing only the nil was
+		//     not enough.
+		//  2. A concurrent AddPreload or a newer retry won while we were dialing.
+		//
+		// preloadRetries[name] == stop is the single test for "still ours, still wanted":
+		// a canceller deletes the entry, and a replacement overwrites it, so anything other
+		// than our own channel means do not register.
 		preloadsMu.Lock()
-		if preloads[name] == nil {
+		if preloadRetries[name] == stop && preloads[name] == nil {
 			preloads[name] = &Preload{stream: stream, Cons: cons, Query: rawQuery}
 			preloadsMu.Unlock()
 		} else {
