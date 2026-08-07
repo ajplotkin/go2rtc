@@ -61,6 +61,45 @@ func TestWriteBufferWriteAfterCloseDoesNotReachWriter(t *testing.T) {
 	require.Zero(t, cw.writes, "Write after Close reached the underlying writer")
 }
 
+// closerWriter is an io.Writer that is ALSO an io.Closer, which sends Close() down the
+// early-return branch — the path internal/rtmp uses by handing WriteTo a net.Conn.
+type closerWriter struct{ closed bool }
+
+func (c *closerWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (c *closerWriter) Close() error                { c.closed = true; return nil }
+
+// A WriteTo blocked on an io.Closer target must still unblock on Close.
+//
+// This branch previously returned before calling done(). Upstream gets away with that
+// because the next Write hits the dead connection, fails, sets err and calls done() --
+// but once Close sets err itself, Write short-circuits before touching the writer and
+// that escape hatch disappears, stranding the WriteTo goroutine forever. Removing the
+// done() from the Closer branch makes this test hang and fail.
+func TestWriteBufferCloseUnblocksWriteToOnCloserTarget(t *testing.T) {
+	wb := NewWriteBuffer(nil)
+	target := &closerWriter{} // WriteTo swaps this in as w.Writer; Close() then sees a Closer
+
+	returned := make(chan struct{})
+	go func() {
+		_, _ = wb.WriteTo(target) // no keyframe is ever written
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+		t.Fatal("WriteTo returned before any keyframe or Close")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	require.NoError(t, wb.Close())
+
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("WriteTo did not unblock after Close on an io.Closer target - goroutine leaked")
+	}
+}
+
 // Close before WriteTo registers its wait must not block WriteTo forever.
 func TestWriteBufferCloseBeforeWriteTo(t *testing.T) {
 	wb := NewWriteBuffer(nil)

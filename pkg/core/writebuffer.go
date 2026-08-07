@@ -56,11 +56,21 @@ func (w *WriteBuffer) Close() error {
 	if closer, ok := writer.(io.Closer); ok {
 		// Mark closed on this path too. Returning early left err nil, so a later Write
 		// had nothing to reject on -- same hazard as below.
+		//
+		// done() is REQUIRED here, not optional. Upstream leaves this path alone, and it
+		// got away with it because a blocked WriteTo was freed indirectly: the next Write
+		// hit the now-closed connection, failed, set err and called done(). Setting err
+		// here removes that escape hatch, because Write() short-circuits on err BEFORE
+		// touching the writer -- so without this the WriteTo goroutine would block
+		// forever. Reachable for any consumer whose WriteTo target is an io.Closer, e.g.
+		// internal/rtmp passing a net.Conn. Not a path this deployment uses, but adding
+		// err without done() would be strictly worse than not touching this branch.
 		w.mu.Lock()
 		w.closed = true
 		if w.err == nil {
 			w.err = io.ErrClosedPipe
 		}
+		w.done()
 		w.mu.Unlock()
 		return closer.Close()
 	}
