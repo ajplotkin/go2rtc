@@ -64,6 +64,13 @@ func AddPreload(name, rawQuery string) error {
 
 	if p := preloads[name]; p != nil {
 		p.stream.RemoveConsumer(p.Cons)
+		// Delete the entry too, not just its consumer. If the fresh dial below fails we
+		// return early, and leaving the old entry behind means: the API reports a healthy
+		// preload whose consumer is gone, AND the retry goroutine we just spawned exits on
+		// its first wake because `preloads[name] != nil` -- so the background reattach this
+		// whole mechanism exists for never happens. Reachable via PUT /api/preload on an
+		// existing name while the camera is off.
+		delete(preloads, name)
 	}
 
 	stream := Get(name)
