@@ -32,6 +32,11 @@ var preloadsMu sync.Mutex
 //     2-minute cadence against the same quota, until one happened to succeed.
 var preloadRetries = map[string]chan struct{}{}
 
+// Retry cadence. A variable rather than a constant purely so tests can drive
+// retryPreload() itself instead of re-implementing its logic -- a test that copies the
+// decision it means to check passes no matter what the real code does.
+var preloadRetryInterval = 2 * time.Minute
+
 // cancelRetryLocked stops any in-flight retry for name. preloadsMu must be held.
 // The canceller closes the channel and removes the entry; the goroutine only ever
 // reads from it, so there is exactly one closer and no double-close.
@@ -112,7 +117,7 @@ func retryPreload(name, rawQuery string, query url.Values, stop chan struct{}) {
 		select {
 		case <-stop:
 			return
-		case <-time.After(2 * time.Minute):
+		case <-time.After(preloadRetryInterval):
 		}
 
 		// Decide whether we still need to retry, then release the lock BEFORE the network dial
