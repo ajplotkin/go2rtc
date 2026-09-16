@@ -152,10 +152,14 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// Monotonic base for the drought timestamps below. These MUST NOT round-trip through
 		// time.Now().UnixNano(): an int64 cannot carry a monotonic reading and time.Unix(0, ns)
 		// cannot restore one, so every time.Since() on them measures the WALL clock. A forward
-		// NTP step then reads as a media gap -- observed live as a bogus 17.94s idr_age whose
-		// watchdog had armed 19s earlier with no ticks in between, on a Pi with no RTC where
-		// go2rtc dialled before the first time sync -- and a step past the full-stall deadline
-		// would tear down a perfectly healthy stream.
+		// NTP step then reads as a media gap: observed live as a bogus 17.94s idr_age on the
+		// first Nest dial after a reboot, on a Pi with no RTC that had not yet synced.
+		//
+		// The step showed up ONLY on the keyframe age. video_age on the same tick was 43ms,
+		// because every packet refreshes it and packets arrive far more often than the 1s tick,
+		// so a step lands between two packets and is erased before the watchdog looks. The real
+		// hazard is that a step ADDS ITSELF to whichever gap is already open when it lands: a
+		// modest genuine drought plus a step can cross a deadline neither would reach alone.
 		//
 		// A time.Time per track keeps the monotonic reading but does not fit in an atomic.Int64,
 		// and atomic.Pointer[time.Time] allocates on every packet. Storing elapsed-since-base
