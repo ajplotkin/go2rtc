@@ -146,6 +146,8 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// separate avoids the connect watchdog killing a healthy non-H264 stream every 30s.
 		isNestVideoTrack := c.FormatName == "nest/webrtc" && remote.Kind() == webrtc.RTPCodecTypeVideo
 		isNestVideo := isNestVideoTrack && codec.Name == core.CodecH264
+		// Declared out here so the read-loop exit paths below can name the session in their logs.
+		var connID int64
 		if isNestVideoTrack {
 			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 		}
@@ -231,7 +233,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			now := int64(time.Since(nestEpoch))
 			lastVideoNS.Store(now)
 			lastIDRNS.Store(now)
-			connID := nestConnSeq.Add(1)
+			connID = nestConnSeq.Add(1)
 			zlog.Debug().Int64("conn", connID).Msg("nest: stall watchdog armed")
 			stallDone := make(chan struct{})
 			defer close(stallDone)
@@ -276,6 +278,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			b := make([]byte, ReceiveMTU)
 			n, _, err := remote.Read(b)
 			if err != nil {
+				// Patched (Nest): a fatal read ends THIS goroutine, and with it the deferred
+				// close(stallDone) tears down the stall watchdog -- so the one thing that would
+				// have noticed the dead video is gone at exactly the moment it is needed. The
+				// connect watchdog cannot cover it either: nestVideoSeen is a one-way latch set
+				// by the first video packet, so it has already been disarmed. Meanwhile ICE stays
+				// up on Google's consent checks alone, with or without audio, so the transport
+				// lingers and Producer.reconnect() is never reached. Close it here instead.
+				// Upstream returns silently, which is also why this was invisible for so long.
+				if isNestVideoTrack {
+					zlog.Warn().Int64("conn", connID).Err(err).
+						Msg("nest: video track read failed, closing transport")
+					_ = c.Close()
+				}
 				return
 			}
 
@@ -283,6 +298,15 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 
 			packet := &rtp.Packet{}
 			if err := packet.Unmarshal(b[:n]); err != nil {
+				// Same reasoning as the read error above. Reachable on a single malformed packet:
+				// rtp.Packet.Unmarshal returns errTooSmall when the padding-count byte exceeds the
+				// packet, and that byte sits inside the SRTP-encrypted portion, so nothing upstream
+				// validates it before this point.
+				if isNestVideoTrack {
+					zlog.Warn().Int64("conn", connID).Err(err).
+						Msg("nest: RTP unmarshal failed, closing transport")
+					_ = c.Close()
+				}
 				return
 			}
 
