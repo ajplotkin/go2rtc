@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -286,9 +288,17 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 				// up on Google's consent checks alone, with or without audio, so the transport
 				// lingers and Producer.reconnect() is never reached. Close it here instead.
 				// Upstream returns silently, which is also why this was invisible for so long.
+				// io.EOF is what a read returns once the PeerConnection is already closing
+				// (pion rtpreceiver readRTP on closedChan, and packetio once the buffer is
+				// closed), so it is the NORMAL end of every intentional teardown: a watchdog
+				// kill, Producer.reconnect's Stop, or a stream shutdown. Closing again is
+				// harmless and idempotent, but warning about it would fire on every clean
+				// re-dial and bury the real thing this is here to surface.
 				if isNestVideoTrack {
-					zlog.Warn().Int64("conn", connID).Err(err).
-						Msg("nest: video track read failed, closing transport")
+					if !errors.Is(err, io.EOF) {
+						zlog.Warn().Int64("conn", connID).Err(err).
+							Msg("nest: video track read failed, closing transport")
+					}
 					_ = c.Close()
 				}
 				return
@@ -307,6 +317,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 						Msg("nest: RTP unmarshal failed, closing transport")
 					_ = c.Close()
 				}
+				// No io.EOF guard here: Unmarshal never returns it, so any error is real.
 				return
 			}
 
