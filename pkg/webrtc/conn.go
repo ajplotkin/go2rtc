@@ -149,6 +149,18 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		if isNestVideoTrack {
 			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 		}
+		// Monotonic base for the drought timestamps below. These MUST NOT round-trip through
+		// time.Now().UnixNano(): an int64 cannot carry a monotonic reading and time.Unix(0, ns)
+		// cannot restore one, so every time.Since() on them measures the WALL clock. A forward
+		// NTP step then reads as a media gap -- observed live as a bogus 17.94s idr_age whose
+		// watchdog had armed 19s earlier with no ticks in between, on a Pi with no RTC where
+		// go2rtc dialled before the first time sync -- and a step past the full-stall deadline
+		// would tear down a perfectly healthy stream.
+		//
+		// A time.Time per track keeps the monotonic reading but does not fit in an atomic.Int64,
+		// and atomic.Pointer[time.Time] allocates on every packet. Storing elapsed-since-base
+		// keeps the plain atomics and stays on the monotonic clock.
+		nestEpoch := time.Now()
 		var lastVideoNS, lastIDRNS atomic.Int64
 
 		// Patched: also request periodic keyframes for the Nest source (ModeActiveProducer,
@@ -212,7 +224,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// At 60s it fires only on a session that is never coming back. connID distinguishes cameras in
 		// the logs — Nest assigns SSRC 7777 to every camera, so SSRC can't tell them apart.
 		if isNestVideo {
-			now := time.Now().UnixNano()
+			now := int64(time.Since(nestEpoch))
 			lastVideoNS.Store(now)
 			lastIDRNS.Store(now)
 			connID := nestConnSeq.Add(1)
@@ -225,8 +237,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 				for {
 					select {
 					case <-t.C:
-						videoAge := time.Since(time.Unix(0, lastVideoNS.Load()))
-						idrAge := time.Since(time.Unix(0, lastIDRNS.Load()))
+						elapsed := time.Since(nestEpoch)
+						videoAge := elapsed - time.Duration(lastVideoNS.Load())
+						idrAge := elapsed - time.Duration(lastIDRNS.Load())
 						if videoAge > 3*time.Second || idrAge > 3*time.Second {
 							zlog.Debug().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("nest: no recent video/keyframe")
 						}
@@ -277,9 +290,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 
 			if isNestVideo {
-				lastVideoNS.Store(time.Now().UnixNano())
+				lastVideoNS.Store(int64(time.Since(nestEpoch)))
 				if isRTPKeyframe(packet.Payload) {
-					lastIDRNS.Store(time.Now().UnixNano())
+					lastIDRNS.Store(int64(time.Since(nestEpoch)))
 				}
 			}
 
