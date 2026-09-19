@@ -44,11 +44,22 @@ func (w *Waiter) Done(err error) {
 	// safe run Done only when have tasks
 	if w.state > 0 {
 		w.state--
-		w.WaitGroup.Done()
-	}
 
-	// block waiter for any operations after last done
-	if w.state == 0 {
+		// Publish the result BEFORE the WaitGroup.Done() that releases waiters.
+		// Wait() reads w.err without holding w.mu, and WaitGroup.Done() unblocks it
+		// immediately, so writing w.err afterwards let a waiter read the previous value
+		// and report success for a connection that ended with an error. Reproduced under
+		// -race: Wait() at the `return w.err` line against Done() at the `w.err = err`
+		// line. Ordering the write first also gives the read a happens-before edge
+		// through the WaitGroup, so no lock is needed on the Wait() side.
+		if w.state == 0 {
+			w.state = -1
+			w.err = err
+		}
+
+		w.WaitGroup.Done()
+	} else if w.state == 0 {
+		// block waiter for any operations after last done
 		w.state = -1
 		w.err = err
 	}

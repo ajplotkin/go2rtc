@@ -150,6 +150,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		isNestVideo := isNestVideoTrack && codec.Name == core.CodecH264
 		// Declared out here so the read-loop exit paths below can name the session in their logs.
 		var connID int64
+		var badRTP int
 		if isNestVideoTrack {
 			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 		}
@@ -308,16 +309,26 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 
 			packet := &rtp.Packet{}
 			if err := packet.Unmarshal(b[:n]); err != nil {
-				// Same reasoning as the read error above. Reachable on a single malformed packet:
-				// rtp.Packet.Unmarshal returns errTooSmall when the padding-count byte exceeds the
-				// packet, and that byte sits inside the SRTP-encrypted portion, so nothing upstream
-				// validates it before this point.
+				// Discard the packet and keep reading, rather than closing as the read-error
+				// path above does. This is reachable on a SINGLE malformed packet:
+				// rtp.Packet.Unmarshal returns errTooSmall when the padding-count byte exceeds
+				// the packet, and that byte sits inside the SRTP-encrypted portion, so nothing
+				// upstream validates it before this point. Tearing down a healthy session over
+				// one bad packet is the same false-positive teardown the 4s keyframe deadline
+				// used to cause. If video really has stopped, lastVideoNS stops advancing and
+				// the stall watchdog closes the transport anyway, so patience costs nothing.
+				//
+				// Upstream returns here, which kills the track silently. Gated to Nest to bound
+				// the blast radius. Credit to donparlor (AlexxIT/go2rtc#2351), who reached this
+				// conclusion independently and shipped it first.
 				if isNestVideoTrack {
-					zlog.Warn().Int64("conn", connID).Err(err).
-						Msg("nest: RTP unmarshal failed, closing transport")
-					_ = c.Close()
+					badRTP++
+					if badRTP == 1 || badRTP%100 == 0 {
+						zlog.Warn().Int64("conn", connID).Err(err).Int("discarded", badRTP).
+							Msg("nest: discarding malformed RTP packet")
+					}
+					continue
 				}
-				// No io.EOF guard here: Unmarshal never returns it, so any error is real.
 				return
 			}
 
