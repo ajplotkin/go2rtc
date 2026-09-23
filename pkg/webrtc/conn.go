@@ -220,9 +220,18 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// producer.go re-dial a fresh session (a REPLACEMENT: the old pc is closed here first):
 		//   - no real video RTP at all for 8s (full stall), or
 		//   - real video flows but no keyframe for 60s (a session gone permanently dry).
-		// A fresh session is the ONLY thing that ends a drought: Nest withholds video ~12-24s after a
-		// motion event and IGNORES FIR (verified 2026-07-22 17:12 UTC: idr_age climbed past 11s while
-		// FIR was sent 5x), but a re-dialed session opens with an IDR and recovers in ~2-4s.
+		// A fresh session is usually what ends a drought: Nest withholds video ~12-24s after a motion
+		// event and IGNORES FIR (verified 2026-07-22 17:12 UTC: idr_age climbed past 11s while FIR was
+		// sent 5x), and a re-dial normally opens with an IDR and recovers in ~2-4s.
+		//
+		// CORRECTED 2026-09-23: "opens with an IDR" is not reliable, which is why this branch earns
+		// its place. On 2026-09-21, after a 5m40s window in which every GenerateWebRtcStream dial hit
+		// its client timeout, the doorbell re-dialed three times in a row (conns 47, 49, 50) and each
+		// new session ran a full 60s with no keyframe, tripping this branch each time. Two of the
+		// three still had RTP arriving at the fire (video_age 0.8s and 1.6s), so a no-video watchdog
+		// would not have caught them at any threshold. Other sessions in the same recovery went 45-58s
+		// without a keyframe and then recovered unaided, against a 13.8s maximum everywhere else in a
+		// 6.6-day window.
 		//
 		// The keyframe deadline was 4s and that was WRONG. Measured over 48h (2026-08-03/04): it fired
 		// 23 times, and 13 of those killed a session whose video had arrived under 2s earlier (median
