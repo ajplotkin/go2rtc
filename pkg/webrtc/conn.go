@@ -4,9 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -150,7 +148,6 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		isNestVideo := isNestVideoTrack && codec.Name == core.CodecH264
 		// Declared out here so the read-loop exit paths below can name the session in their logs.
 		var connID int64
-		var badRTP int
 		if isNestVideoTrack {
 			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 		}
@@ -220,18 +217,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// producer.go re-dial a fresh session (a REPLACEMENT: the old pc is closed here first):
 		//   - no real video RTP at all for 8s (full stall), or
 		//   - real video flows but no keyframe for 60s (a session gone permanently dry).
-		// A fresh session is usually what ends a drought: Nest withholds video ~12-24s after a motion
-		// event and IGNORES FIR (verified 2026-07-22 17:12 UTC: idr_age climbed past 11s while FIR was
-		// sent 5x), and a re-dial normally opens with an IDR and recovers in ~2-4s.
-		//
-		// CORRECTED 2026-09-23: "opens with an IDR" is not reliable, which is why this branch earns
-		// its place. On 2026-09-21, after a 5m40s window in which every GenerateWebRtcStream dial hit
-		// its client timeout, the doorbell re-dialed three times in a row (conns 47, 49, 50) and each
-		// new session ran a full 60s with no keyframe, tripping this branch each time. Two of the
-		// three still had RTP arriving at the fire (video_age 0.8s and 1.6s), so a no-video watchdog
-		// would not have caught them at any threshold. Other sessions in the same recovery went 45-58s
-		// without a keyframe and then recovered unaided, against a 13.8s maximum everywhere else in a
-		// 6.6-day window.
+		// A fresh session is the ONLY thing that ends a drought: Nest withholds video ~12-24s after a
+		// motion event and IGNORES FIR (verified 2026-07-22 17:12 UTC: idr_age climbed past 11s while
+		// FIR was sent 5x), but a re-dialed session opens with an IDR and recovers in ~2-4s.
 		//
 		// The keyframe deadline was 4s and that was WRONG. Measured over 48h (2026-08-03/04): it fired
 		// 23 times, and 13 of those killed a session whose video had arrived under 2s earlier (median
@@ -298,14 +286,29 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 				// up on Google's consent checks alone, with or without audio, so the transport
 				// lingers and Producer.reconnect() is never reached. Close it here instead.
 				// Upstream returns silently, which is also why this was invisible for so long.
-				// io.EOF is what a read returns once the PeerConnection is already closing
-				// (pion rtpreceiver readRTP on closedChan, and packetio once the buffer is
-				// closed), so it is the NORMAL end of every intentional teardown: a watchdog
-				// kill, Producer.reconnect's Stop, or a stream shutdown. Closing again is
-				// harmless and idempotent, but warning about it would fire on every clean
-				// re-dial and bury the real thing this is here to surface.
+				// Warn only when the read failed on a connection that is still OPEN. That is the
+				// case this path exists for: the video track has died but the transport lingers,
+				// so without the Close below it would be a zombie.
+				//
+				// Every intentional teardown also ends here, and must stay quiet: a watchdog kill,
+				// Producer.reconnect's Stop, a stream shutdown, or a remote close handled in
+				// OnConnectionStateChange. Those produce more than one error value. The read
+				// returns io.EOF once the receiver stops, but when transport-cc is negotiated the
+				// TWCC interceptor sits in the read path and returns "interceptor is closed" for a
+				// packet dequeued after the interceptors close. That sentinel is unexported
+				// (pion/interceptor twcc errClosed), so it cannot be matched with errors.Is.
+				//
+				// Keying on connection state covers all of them without listing error values.
+				// pion's PeerConnection.close() sets SignalingStateClosed (atomically) BEFORE it
+				// stops the transceivers and BEFORE it closes the interceptors, so by the time the
+				// read loop sees any teardown error, SignalingState() already reads Closed. It also
+				// fixes a flaw in -15..-17, which excluded only io.EOF: that both missed the TWCC
+				// case and would have hidden an io.EOF arriving on a still-open connection, which
+				// is precisely the zombie worth reporting.
+				//
+				// Close unconditionally: it is idempotent, and harmless if already closing.
 				if isNestVideoTrack {
-					if !errors.Is(err, io.EOF) {
+					if c.pc.SignalingState() != webrtc.SignalingStateClosed {
 						zlog.Warn().Int64("conn", connID).Err(err).
 							Msg("nest: video track read failed, closing transport")
 					}
@@ -318,26 +321,16 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 
 			packet := &rtp.Packet{}
 			if err := packet.Unmarshal(b[:n]); err != nil {
-				// Discard the packet and keep reading, rather than closing as the read-error
-				// path above does. This is reachable on a SINGLE malformed packet:
-				// rtp.Packet.Unmarshal returns errTooSmall when the padding-count byte exceeds
-				// the packet, and that byte sits inside the SRTP-encrypted portion, so nothing
-				// upstream validates it before this point. Tearing down a healthy session over
-				// one bad packet is the same false-positive teardown the 4s keyframe deadline
-				// used to cause. If video really has stopped, lastVideoNS stops advancing and
-				// the stall watchdog closes the transport anyway, so patience costs nothing.
-				//
-				// Upstream returns here, which kills the track silently. Gated to Nest to bound
-				// the blast radius. Credit to donparlor (AlexxIT/go2rtc#2351), who reached this
-				// conclusion independently and shipped it first.
+				// Same reasoning as the read error above. Reachable on a single malformed packet:
+				// rtp.Packet.Unmarshal returns errTooSmall when the padding-count byte exceeds the
+				// packet, and that byte sits inside the SRTP-encrypted portion, so nothing upstream
+				// validates it before this point.
 				if isNestVideoTrack {
-					badRTP++
-					if badRTP == 1 || badRTP%100 == 0 {
-						zlog.Warn().Int64("conn", connID).Err(err).Int("discarded", badRTP).
-							Msg("nest: discarding malformed RTP packet")
-					}
-					continue
+					zlog.Warn().Int64("conn", connID).Err(err).
+						Msg("nest: RTP unmarshal failed, closing transport")
+					_ = c.Close()
 				}
+				// No io.EOF guard here: Unmarshal never returns it, so any error is real.
 				return
 			}
 
