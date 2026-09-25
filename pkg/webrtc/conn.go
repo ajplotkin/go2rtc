@@ -298,10 +298,16 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 				// packet dequeued after the interceptors close. That sentinel is unexported
 				// (pion/interceptor twcc errClosed), so it cannot be matched with errors.Is.
 				//
-				// Keying on connection state covers all of them without listing error values.
+				// Keying on the SIGNALING state covers all of them without listing error values.
 				// pion's PeerConnection.close() sets SignalingStateClosed (atomically) BEFORE it
 				// stops the transceivers and BEFORE it closes the interceptors, so by the time the
-				// read loop sees any teardown error, SignalingState() already reads Closed. It also
+				// read loop sees any teardown error, SignalingState() already reads Closed.
+				//
+				// Do NOT "simplify" this to pc.ConnectionState() != PeerConnectionStateClosed.
+				// ConnectionState only reaches Closed in close()'s updateConnectionState step,
+				// which runs AFTER the transceivers are stopped. The read error fires first, so a
+				// ConnectionState guard would warn on every teardown. Only SignalingState is set
+				// early enough. It also
 				// fixes a flaw in -15..-17, which excluded only io.EOF: that both missed the TWCC
 				// case and would have hidden an io.EOF arriving on a still-open connection, which
 				// is precisely the zombie worth reporting.
