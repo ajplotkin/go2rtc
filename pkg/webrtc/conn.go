@@ -13,6 +13,7 @@ import (
 	"github.com/AlexxIT/go2rtc/pkg/h264"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 	zlog "github.com/rs/zerolog/log"
 )
@@ -149,6 +150,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// Declared out here so the read-loop exit paths below can name the session in their logs.
 		var connID int64
 		var badRTP int
+		var nestReorder nestRTPReorder
+		var nestWaitPartitionHead bool
+		var nestPartitionHead codecs.H264Packet
 		if isNestVideoTrack {
 			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 		}
@@ -361,21 +365,14 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 				return
 			}
 
-			if len(packet.Payload) == 0 {
-				// WebRTC padding / bandwidth-probe packet: not real media. Must NOT refresh
-				// lastVideoNS, or a camera that keeps probing through a drought would keep the
-				// "no video RTP" watchdog from ever firing.
-				continue
-			}
-
-			if isNestVideo {
+			if len(packet.Payload) != 0 && isNestVideo {
 				lastVideoNS.Store(int64(time.Since(nestEpoch)))
 				if isRTPKeyframe(packet.Payload) {
 					lastIDRNS.Store(int64(time.Since(nestEpoch)))
 				}
 			}
 
-			if captureSprop {
+			if len(packet.Payload) != 0 && captureSprop {
 				save := func(nal []byte) {
 					if len(nal) == 0 {
 						return
@@ -409,6 +406,53 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 						base64.StdEncoding.EncodeToString(spropPPS)
 					captureSprop = false
 				}
+			}
+
+			if isNestVideo {
+				result := nestReorder.push(packet, time.Now())
+
+				if result.gapExpired {
+					// The bounded reorder window has expired, so this is real
+					// loss rather than a late retransmission. If the loss
+					// occurred inside a fragmented NAL, discard its orphan tail
+					// and resume at the next partition head.
+					nestWaitPartitionHead = true
+
+					zlog.Warn().
+						Int64("conn", connID).
+						Int("missing", int(result.missing)).
+						Msg("nest: RTP reorder gap abandoned, waiting for partition head")
+				}
+
+				for _, ordered := range result.packets {
+					// Padding filled its RTP sequence slot but remains non-media,
+					// matching the old behaviour of not forwarding it downstream.
+					if len(ordered.Payload) == 0 {
+						continue
+					}
+
+					if nestWaitPartitionHead {
+						// After a known loss, discard any orphan FU-A/FU-B tail.
+						// Resume at the next packet that can begin a complete NAL.
+						if !nestPartitionHead.IsPartitionHead(ordered.Payload) {
+							continue
+						}
+
+						nestWaitPartitionHead = false
+						zlog.Debug().
+							Int64("conn", connID).
+							Uint16("seq", ordered.SequenceNumber).
+							Msg("nest: RTP recovered at partition head")
+					}
+
+					track.WriteRTP(ordered)
+				}
+				continue
+			}
+
+			// Preserve the existing behaviour for every non-Nest-H264 track.
+			if len(packet.Payload) == 0 {
+				continue
 			}
 
 			track.WriteRTP(packet)
