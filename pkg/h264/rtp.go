@@ -32,6 +32,11 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 	// Wait for a partition head before feeding the depayloader anything.
 	synced := false
 
+	// Track fragmented NAL state after initial sync as well. pion's
+	// H264Packet appends FU-A payloads without validating the start bit, so
+	// an interrupted fragmented NAL must not contaminate the next one.
+	inFragment := false
+
 	return func(packet *rtp.Packet) {
 		if !synced {
 			if !depack.IsPartitionHead(packet.Payload) {
@@ -40,9 +45,43 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 			synced = true
 		}
 
+		fuaEnd := false
+
+		if len(packet.Payload) >= 2 && packet.Payload[0]&0x1F == fuaNALUType {
+			fuaStart := packet.Payload[1]&0x80 != 0
+			fuaEnd = packet.Payload[1]&0x40 != 0
+
+			switch {
+			case fuaStart:
+				// A new FU-A start is authoritative. If the previous fragmented
+				// NAL never completed, discard both its pion fragment buffer and
+				// any partially collected access unit before starting fresh.
+				if inFragment {
+					buf = buf[:0]
+				}
+				depack = &codecs.H264Packet{IsAVC: true}
+				inFragment = true
+
+			case !inFragment:
+				// Middle/end fragment without a start. This can happen after
+				// packet loss or when attaching in the middle of a fragmented NAL.
+				return
+			}
+		} else if inFragment {
+			// A non-FU-A packet cannot complete the fragmented NAL we were
+			// assembling. Discard the stale fragment/access-unit state.
+			depack = &codecs.H264Packet{IsAVC: true}
+			inFragment = false
+			buf = buf[:0]
+		}
+
 		//log.Printf("[RTP] codec: %s, nalu: %2d, size: %6d, ts: %10d, pt: %2d, ssrc: %d, seq: %d, %v", codec.Name, packet.Payload[0]&0x1F, len(packet.Payload), packet.Timestamp, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Marker)
 
 		payload, err := depack.Unmarshal(packet.Payload)
+
+		if fuaEnd {
+			inFragment = false
+		}
 		if len(payload) == 0 || err != nil {
 			return
 		}
