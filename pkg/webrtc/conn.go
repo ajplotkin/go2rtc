@@ -412,39 +412,27 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 				result := nestReorder.push(packet, time.Now())
 
 				if result.gapExpired {
-					// The bounded reorder window has expired, so this is real
-					// loss rather than a late retransmission. If the loss
-					// occurred inside a fragmented NAL, discard its orphan tail
-					// and resume at the next partition head.
-					nestWaitPartitionHead = true
-
 					zlog.Warn().
 						Int64("conn", connID).
 						Int("missing", int(result.missing)).
 						Msg("nest: RTP reorder gap abandoned, waiting for partition head")
 				}
 
-				for _, ordered := range result.packets {
-					// Padding filled its RTP sequence slot but remains non-media,
-					// matching the old behaviour of not forwarding it downstream.
-					if len(ordered.Payload) == 0 {
-						continue
-					}
+				write := nestRTPPacketsToWrite(
+					result,
+					nestWaitPartitionHead,
+					&nestPartitionHead,
+				)
+				nestWaitPartitionHead = write.waitPartitionHead
 
-					if nestWaitPartitionHead {
-						// After a known loss, discard any orphan FU-A/FU-B tail.
-						// Resume at the next packet that can begin a complete NAL.
-						if !nestPartitionHead.IsPartitionHead(ordered.Payload) {
-							continue
-						}
+				if write.recovered {
+					zlog.Debug().
+						Int64("conn", connID).
+						Uint16("seq", write.recoveredSeq).
+						Msg("nest: RTP recovered at partition head")
+				}
 
-						nestWaitPartitionHead = false
-						zlog.Debug().
-							Int64("conn", connID).
-							Uint16("seq", ordered.SequenceNumber).
-							Msg("nest: RTP recovered at partition head")
-					}
-
+				for _, ordered := range write.packets {
 					track.WriteRTP(ordered)
 				}
 				continue

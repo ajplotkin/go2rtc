@@ -4,18 +4,19 @@ import (
 	"time"
 
 	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 )
 
-// Nest retransmissions have been observed arriving roughly 60-140ms after
-// newer H264 RTP packets. Wait up to 200ms for a missing sequence number:
-// enough for pion's 100ms NACK cycle plus network round-trip, without adding
-// latency to normal in-order traffic.
+// Nest retransmissions are commonly delayed by tens to hundreds of
+// milliseconds. Multi-camera diagnostics observed p99 around 277ms, so wait
+// up to 300ms for a missing sequence number. The wait applies only while a
+// sequence gap is open and adds no latency to normal in-order traffic.
 //
 // Bound pending packets as well as time. Real traces have shown retransmitted
 // packets arriving more than 50 sequence numbers behind the newest packet, so
 // 128 leaves margin while keeping the queue strictly bounded.
 const (
-	nestRTPReorderMaxWait    = 200 * time.Millisecond
+	nestRTPReorderMaxWait    = 300 * time.Millisecond
 	nestRTPReorderMaxPending = 128
 )
 
@@ -31,6 +32,11 @@ type nestRTPReorder struct {
 
 	pending  map[uint16]*rtp.Packet
 	gapSince time.Time
+
+	// A sustained run of packets that all appear behind the playout head can
+	// indicate that the sender reset its RTP sequence number while keeping the
+	// same SSRC. A single late packet must not disturb a healthy stream.
+	behindHead int
 }
 
 // push accepts RTP packets in arrival order and returns packets that are safe
@@ -53,7 +59,7 @@ func (r *nestRTPReorder) push(packet *rtp.Packet, now time.Time) nestRTPReorderR
 	}
 
 	// Expire an existing gap BEFORE considering the newly arrived packet.
-	// Therefore a retransmission arriving after the 200ms deadline cannot
+	// Therefore a retransmission arriving after the 300ms deadline cannot
 	// retroactively heal a gap whose wait window has already elapsed.
 	if !r.gapSince.IsZero() && now.Sub(r.gapSince) >= nestRTPReorderMaxWait {
 		packets, missing := r.expireGap(now)
@@ -66,11 +72,31 @@ func (r *nestRTPReorder) push(packet *rtp.Packet, now time.Time) nestRTPReorderR
 
 	diff := int16(packet.SequenceNumber - r.next)
 
-	// Behind the playout head: either an ordinary duplicate or a
+	// Behind the playout head: normally an ordinary duplicate or a
 	// retransmission that arrived after its reorder window expired.
+	//
+	// Signed 16-bit RTP sequence comparisons are intentionally ambiguous for
+	// jumps of half the sequence space or more. If a sustained run of packets
+	// all appears behind the head, assume the sender reset its sequence number
+	// while retaining the same SSRC and re-anchor on the current packet.
 	if diff < 0 {
+		r.behindHead++
+		if r.behindHead < nestRTPReorderMaxPending {
+			return result
+		}
+
+		r.next = packet.SequenceNumber
+		r.pending = make(map[uint16]*rtp.Packet)
+		r.gapSince = time.Time{}
+		r.behindHead = 0
+
+		r.pending[packet.SequenceNumber] = packet
+		result.packets = append(result.packets, r.drain(now)...)
 		return result
 	}
+
+	// Any packet at or ahead of the current head breaks a behind-head streak.
+	r.behindHead = 0
 
 	// A packet already waiting in the queue is a duplicate retransmission.
 	if _, ok := r.pending[packet.SequenceNumber]; ok {
@@ -95,6 +121,48 @@ func (r *nestRTPReorder) push(packet *rtp.Packet, now time.Time) nestRTPReorderR
 	}
 
 	return result
+}
+
+type nestRTPWriteResult struct {
+	packets           []*rtp.Packet
+	waitPartitionHead bool
+	recovered         bool
+	recoveredSeq      uint16
+}
+
+// nestRTPPacketsToWrite applies the post-reorder H264 recovery gate.
+//
+// Once a reorder gap has been abandoned, packets are suppressed until a
+// partition head arrives so an orphan FU-A/FU-B tail is never forwarded.
+// Padding occupies sequence-number space but is never written downstream.
+func nestRTPPacketsToWrite(
+	result nestRTPReorderResult,
+	waitPartitionHead bool,
+	partitionHead *codecs.H264Packet,
+) nestRTPWriteResult {
+	write := nestRTPWriteResult{
+		waitPartitionHead: waitPartitionHead || result.gapExpired,
+	}
+
+	for _, packet := range result.packets {
+		if len(packet.Payload) == 0 {
+			continue
+		}
+
+		if write.waitPartitionHead {
+			if !partitionHead.IsPartitionHead(packet.Payload) {
+				continue
+			}
+
+			write.waitPartitionHead = false
+			write.recovered = true
+			write.recoveredSeq = packet.SequenceNumber
+		}
+
+		write.packets = append(write.packets, packet)
+	}
+
+	return write
 }
 
 // drain emits every contiguous packet starting at the current playout head.

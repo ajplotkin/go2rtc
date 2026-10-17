@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/stretchr/testify/require"
 )
 
@@ -148,13 +149,14 @@ func TestNestRTPReorderLatePacketAfterTimeout(t *testing.T) {
 		r.push(nestTestPacket(102), now.Add(10*time.Millisecond)).packets,
 	)
 
-	// 101 arrives after the 200ms gap deadline. The gap must be expired
+	// 101 arrives after the 300ms gap deadline. The gap must be expired
 	// first, releasing 102; 101 is then behind the playout head and dropped.
-	res := r.push(nestTestPacket(101), now.Add(211*time.Millisecond))
+	res := r.push(nestTestPacket(101), now.Add(311*time.Millisecond))
 
 	require.True(t, res.gapExpired)
 	require.Equal(t, uint16(1), res.missing)
 	require.Equal(t, []uint16{102}, nestPacketSeqs(res.packets))
+	require.Empty(t, r.pending)
 }
 
 func TestNestRTPReorderNewGapGetsFullWindow(t *testing.T) {
@@ -187,7 +189,7 @@ func TestNestRTPReorderNewGapGetsFullWindow(t *testing.T) {
 	require.Empty(t, res.packets)
 	require.False(t, res.gapExpired)
 
-	// Repair it within its own 200ms window.
+	// Repair it within its own 300ms window.
 	res = r.push(nestTestPacket(103), now.Add(300*time.Millisecond))
 	require.Equal(t, []uint16{103, 104, 105}, nestPacketSeqs(res.packets))
 	require.False(t, res.gapExpired)
@@ -216,4 +218,131 @@ func TestNestRTPReorderPendingBound(t *testing.T) {
 	require.Len(t, res.packets, nestRTPReorderMaxPending)
 	require.Equal(t, uint16(102), res.packets[0].SequenceNumber)
 	require.Equal(t, uint16(229), res.packets[len(res.packets)-1].SequenceNumber)
+}
+
+func TestNestRTPReorderResyncAfterLargeForwardJump(t *testing.T) {
+	var r nestRTPReorder
+	now := time.Unix(1, 0)
+
+	require.Equal(t,
+		[]uint16{1000},
+		nestPacketSeqs(r.push(nestTestPacket(1000), now).packets),
+	)
+
+	// A +40000 jump is interpreted as behind by a signed 16-bit comparison.
+	// Do not re-anchor on a single packet, but recover after a sustained run.
+	start := 1001 + 40000
+	var res nestRTPReorderResult
+
+	for i := 0; i < nestRTPReorderMaxPending-1; i++ {
+		res = r.push(
+			nestTestPacket(uint16(start+i)),
+			now.Add(time.Duration(i+1)*time.Millisecond),
+		)
+		require.Empty(t, res.packets)
+	}
+
+	anchor := uint16(start + nestRTPReorderMaxPending - 1)
+	res = r.push(
+		nestTestPacket(anchor),
+		now.Add(nestRTPReorderMaxPending*time.Millisecond),
+	)
+	require.Equal(t, []uint16{anchor}, nestPacketSeqs(res.packets))
+	require.Empty(t, r.pending)
+
+	res = r.push(
+		nestTestPacket(anchor+1),
+		now.Add((nestRTPReorderMaxPending+1)*time.Millisecond),
+	)
+	require.Equal(t, []uint16{anchor + 1}, nestPacketSeqs(res.packets))
+}
+
+func TestNestRTPReorderResyncAfterBackwardJump(t *testing.T) {
+	var r nestRTPReorder
+	now := time.Unix(1, 0)
+
+	require.Equal(t,
+		[]uint16{1000},
+		nestPacketSeqs(r.push(nestTestPacket(1000), now).packets),
+	)
+
+	// The sender resets from expected sequence 1001 back to 465. A short run
+	// could still be delayed traffic, so only re-anchor after the threshold.
+	start := 465
+	var res nestRTPReorderResult
+
+	for i := 0; i < nestRTPReorderMaxPending-1; i++ {
+		res = r.push(
+			nestTestPacket(uint16(start+i)),
+			now.Add(time.Duration(i+1)*time.Millisecond),
+		)
+		require.Empty(t, res.packets)
+	}
+
+	anchor := uint16(start + nestRTPReorderMaxPending - 1)
+	res = r.push(
+		nestTestPacket(anchor),
+		now.Add(nestRTPReorderMaxPending*time.Millisecond),
+	)
+	require.Equal(t, []uint16{anchor}, nestPacketSeqs(res.packets))
+	require.Empty(t, r.pending)
+
+	res = r.push(
+		nestTestPacket(anchor+1),
+		now.Add((nestRTPReorderMaxPending+1)*time.Millisecond),
+	)
+	require.Equal(t, []uint16{anchor + 1}, nestPacketSeqs(res.packets))
+}
+
+func TestNestRTPPacketsToWriteWaitsForPartitionHead(t *testing.T) {
+	var partitionHead codecs.H264Packet
+
+	// A real reorder loss is declared. Padding is ignored, and the FU-A tail
+	// must not be forwarded because its partition head was lost.
+	first := nestRTPPacketsToWrite(
+		nestRTPReorderResult{
+			gapExpired: true,
+			packets: []*rtp.Packet{
+				nestTestPadding(200),
+				{
+					Header:  rtp.Header{SequenceNumber: 201},
+					Payload: []byte{0x7c, 0x05, 0xaa}, // FU-A middle/tail
+				},
+			},
+		},
+		false,
+		&partitionHead,
+	)
+
+	require.Empty(t, first.packets)
+	require.True(t, first.waitPartitionHead)
+	require.False(t, first.recovered)
+
+	// The wait state persists into the next push. Another orphan fragment is
+	// discarded; forwarding resumes exactly at the next FU-A partition head.
+	second := nestRTPPacketsToWrite(
+		nestRTPReorderResult{
+			packets: []*rtp.Packet{
+				{
+					Header:  rtp.Header{SequenceNumber: 202},
+					Payload: []byte{0x7c, 0x05, 0xbb}, // still orphaned
+				},
+				{
+					Header:  rtp.Header{SequenceNumber: 203},
+					Payload: []byte{0x7c, 0x80 | 0x05, 0xcc}, // FU-A start
+				},
+				{
+					Header:  rtp.Header{SequenceNumber: 204},
+					Payload: []byte{0x7c, 0x40 | 0x05, 0xdd}, // FU-A end
+				},
+			},
+		},
+		first.waitPartitionHead,
+		&partitionHead,
+	)
+
+	require.Equal(t, []uint16{203, 204}, nestPacketSeqs(second.packets))
+	require.False(t, second.waitPartitionHead)
+	require.True(t, second.recovered)
+	require.Equal(t, uint16(203), second.recoveredSeq)
 }

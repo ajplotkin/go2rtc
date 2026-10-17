@@ -25,9 +25,21 @@ func testDepay() (core.HandlerFunc, *[][]byte) {
 func TestRTPDepayRestartsOnNewFUAStart(t *testing.T) {
 	handler, got := testDepay()
 
-	// Start a fragmented IDR, but never finish it.
+	// A complete NAL has already been accumulated in this access unit, but the
+	// RTP marker is false, so it has not yet been emitted downstream.
 	handler(&rtp.Packet{
-		Header: rtp.Header{SequenceNumber: 100},
+		Header: rtp.Header{
+			SequenceNumber: 100,
+			Marker:         false,
+		},
+		Payload: []byte{0x41, 0x11, 0x22},
+	})
+
+	require.Empty(t, *got)
+
+	// Start a fragmented IDR in the same access unit, but never finish it.
+	handler(&rtp.Packet{
+		Header: rtp.Header{SequenceNumber: 101},
 		Payload: []byte{
 			0x7c,        // FU-A, NRI=3
 			0x80 | 0x05, // start, IDR
@@ -35,9 +47,10 @@ func TestRTPDepayRestartsOnNewFUAStart(t *testing.T) {
 		},
 	})
 
-	// A new FU-A start means the previous fragmented NAL was abandoned.
+	// A new FU-A start means the previous access unit was abandoned. This must
+	// discard both the unfinished FU-A and the complete NAL already in buf.
 	handler(&rtp.Packet{
-		Header: rtp.Header{SequenceNumber: 101},
+		Header: rtp.Header{SequenceNumber: 102},
 		Payload: []byte{
 			0x7c,
 			0x80 | 0x05,
@@ -45,10 +58,10 @@ func TestRTPDepayRestartsOnNewFUAStart(t *testing.T) {
 		},
 	})
 
-	// Finish the second IDR.
+	// Finish the replacement IDR.
 	handler(&rtp.Packet{
 		Header: rtp.Header{
-			SequenceNumber: 102,
+			SequenceNumber: 103,
 			Marker:         true,
 		},
 		Payload: []byte{
@@ -60,7 +73,8 @@ func TestRTPDepayRestartsOnNewFUAStart(t *testing.T) {
 
 	require.Len(t, *got, 1)
 
-	// AVCC: length=3, NAL header=0x65, then only the SECOND FU payload.
+	// AVCC: length=3, NAL header=0x65, then only the replacement FU payload.
+	// The earlier standalone NAL (0x41 0x11 0x22) must not survive.
 	require.Equal(t,
 		[]byte{0x00, 0x00, 0x00, 0x03, 0x65, 0xbb, 0xcc},
 		(*got)[0],
