@@ -117,3 +117,27 @@ func TestWriteBufferCloseBeforeWriteTo(t *testing.T) {
 		t.Fatal("WriteTo blocked after Close-before-WriteTo - the race window leaks the consumer")
 	}
 }
+
+// closerCountingWriter is an io.Closer that keeps accepting writes after Close, as a
+// connection whose Close hasn't taken effect yet would, and counts every write.
+type closerCountingWriter struct{ writes int }
+
+func (c *closerCountingWriter) Write(p []byte) (int, error) {
+	c.writes++
+	return len(p), nil
+}
+func (c *closerCountingWriter) Close() error { return nil }
+
+// The io.Closer branch of Close must reject later writes too. Before 2f2e9a7 it
+// returned without setting err, so a Write after Close went straight to the target.
+// TestWriteBufferWriteAfterCloseDoesNotReachWriter covers only the other branch.
+func TestWriteBufferWriteAfterCloseOnCloserDoesNotReachWriter(t *testing.T) {
+	cw := &closerCountingWriter{}
+	wb := NewWriteBuffer(cw) // Close() sees an io.Closer and takes that branch
+
+	require.NoError(t, wb.Close())
+
+	_, err := wb.Write([]byte("late"))
+	require.Error(t, err, "Write after Close must return an error")
+	require.Zero(t, cw.writes, "Write after Close reached the underlying writer")
+}
