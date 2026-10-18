@@ -139,3 +139,30 @@ func TestRTPDepayAbandonsFragmentOnStandaloneNAL(t *testing.T) {
 		(*got)[0],
 	)
 }
+
+func TestRTPDepayDropsOrphanEndAfterStandaloneNAL(t *testing.T) {
+	handler, got := testDepay()
+
+	handler(&rtp.Packet{
+		Header:  rtp.Header{SequenceNumber: 100},
+		Payload: []byte{0x7c, 0x80 | 0x05, 0xaa},
+	})
+
+	handler(&rtp.Packet{
+		Header: rtp.Header{
+			SequenceNumber: 101,
+			Marker:         true,
+		},
+		Payload: []byte{0x41, 0x33, 0x44},
+	})
+
+	handler(&rtp.Packet{
+		Header: rtp.Header{
+			SequenceNumber: 102,
+			Marker:         true,
+		},
+		Payload: []byte{0x7c, 0x40 | 0x05, 0xbb},
+	})
+
+	require.Len(t, *got, 1)
+}

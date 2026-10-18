@@ -24,6 +24,10 @@ type nestRTPReorderResult struct {
 	packets    []*rtp.Packet
 	gapExpired bool
 	missing    uint16
+
+	reanchored bool
+	oldHead    uint16
+	newSeq     uint16
 }
 
 type nestRTPReorder struct {
@@ -85,6 +89,10 @@ func (r *nestRTPReorder) push(packet *rtp.Packet, now time.Time) nestRTPReorderR
 			return result
 		}
 
+		result.reanchored = true
+		result.oldHead = r.next
+		result.newSeq = packet.SequenceNumber
+
 		r.next = packet.SequenceNumber
 		r.pending = make(map[uint16]*rtp.Packet)
 		r.gapSince = time.Time{}
@@ -132,8 +140,8 @@ type nestRTPWriteResult struct {
 
 // nestRTPPacketsToWrite applies the post-reorder H264 recovery gate.
 //
-// Once a reorder gap has been abandoned, packets are suppressed until a
-// partition head arrives so an orphan FU-A/FU-B tail is never forwarded.
+// After an abandoned gap or sequence re-anchor, packets are suppressed
+// until a partition head arrives so orphan fragments are never forwarded.
 // Padding occupies sequence-number space but is never written downstream.
 func nestRTPPacketsToWrite(
 	result nestRTPReorderResult,
@@ -141,7 +149,7 @@ func nestRTPPacketsToWrite(
 	partitionHead *codecs.H264Packet,
 ) nestRTPWriteResult {
 	write := nestRTPWriteResult{
-		waitPartitionHead: waitPartitionHead || result.gapExpired,
+		waitPartitionHead: waitPartitionHead || result.gapExpired || result.reanchored,
 	}
 
 	for _, packet := range result.packets {

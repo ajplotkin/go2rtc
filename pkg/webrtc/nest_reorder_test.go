@@ -346,3 +346,78 @@ func TestNestRTPPacketsToWriteWaitsForPartitionHead(t *testing.T) {
 	require.True(t, second.recovered)
 	require.Equal(t, uint16(203), second.recoveredSeq)
 }
+
+func TestNestRTPReorderReanchorWaitsForPartitionHead(t *testing.T) {
+	var r nestRTPReorder
+	var head codecs.H264Packet
+	now := time.Unix(0, 0)
+	wait := false
+	var forwarded []*rtp.Packet
+
+	feed := func(p *rtp.Packet) {
+		w := nestRTPPacketsToWrite(r.push(p, now), wait, &head)
+		wait = w.waitPartitionHead
+		forwarded = append(forwarded, w.packets...)
+	}
+
+	for s := uint16(40000); s < 40010; s++ {
+		feed(&rtp.Packet{
+			Header:  rtp.Header{SequenceNumber: s},
+			Payload: []byte{0x41, 0x01},
+		})
+	}
+
+	feed(&rtp.Packet{
+		Header:  rtp.Header{SequenceNumber: 40010},
+		Payload: []byte{0x7c, 0x80 | 0x05, 0xaa},
+	})
+
+	forwarded = nil
+
+	for i := 0; i < nestRTPReorderMaxPending; i++ {
+		now = now.Add(5 * time.Millisecond)
+		feed(&rtp.Packet{
+			Header: rtp.Header{
+				SequenceNumber: uint16(39000 + i),
+			},
+			Payload: []byte{0x7c, 0x05, 0xbb},
+		})
+	}
+
+	require.Empty(t, forwarded)
+}
+
+func TestNestRTPReorderIsolatedLatePacketsNeverReanchor(t *testing.T) {
+	var r nestRTPReorder
+	now := time.Unix(0, 0)
+	seq := uint16(1000)
+
+	r.push(nestTestPacket(seq), now)
+
+	for i := 0; i < 3*nestRTPReorderMaxPending; i++ {
+		seq++
+		now = now.Add(10 * time.Millisecond)
+
+		res := r.push(nestTestPacket(seq), now)
+		require.Equal(t, []uint16{seq}, nestPacketSeqs(res.packets))
+
+		res = r.push(nestTestPacket(seq-50), now)
+		require.Empty(t, res.packets)
+	}
+}
+
+func TestNestRTPPacketsToWriteSkipsPaddingWhenHealthy(t *testing.T) {
+	var head codecs.H264Packet
+
+	res := nestRTPReorderResult{
+		packets: []*rtp.Packet{
+			nestTestPacket(1),
+			nestTestPadding(2),
+			nestTestPacket(3),
+		},
+	}
+
+	w := nestRTPPacketsToWrite(res, false, &head)
+
+	require.Equal(t, []uint16{1, 3}, nestPacketSeqs(w.packets))
+}

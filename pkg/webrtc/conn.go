@@ -411,6 +411,14 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			if isNestVideo {
 				result := nestReorder.push(packet, time.Now())
 
+				if result.reanchored {
+					zlog.Warn().
+						Int64("conn", connID).
+						Uint16("old_head", result.oldHead).
+						Uint16("new_seq", result.newSeq).
+						Msg("nest: RTP sequence re-anchored")
+				}
+
 				if result.gapExpired {
 					zlog.Warn().
 						Int64("conn", connID).
