@@ -257,6 +257,8 @@ func Test401BodyIsClosed(t *testing.T) {
 
 	rt := &bodyRecorder{base: http.DefaultTransport}
 	http.DefaultTransport = rt
+	// Registered after newFakeGoogle's srv.Close, so it runs first (LIFO) and
+	// srv.Close finds the real transport to close its idle connections on.
 	t.Cleanup(func() { http.DefaultTransport = rt.base })
 
 	_, err := api.ExchangeSDP("project", "device", "offer")
