@@ -62,18 +62,18 @@ func (c *Conn) SetAnswer(answer string) (err error) {
 		Type: webrtc.SDPTypeAnswer,
 		SDP:  fakeFormatsInAnswer(c.pc.LocalDescription().SDP, answer),
 	}
-	if err = c.pc.SetRemoteDescription(desc); err != nil {
-		return err
-	}
 
 	sd := &sdp.SessionDescription{}
 	if err = sd.Unmarshal([]byte(answer)); err != nil {
 		return err
 	}
 
+	// Set Medias before SetRemoteDescription: that call starts the transports, and
+	// OnTrack reads c.Medias in getMediaCodec, which panics if it finds no match.
 	c.Medias = UnmarshalMedias(sd.MediaDescriptions)
 
-	return nil
+	// On failure Medias keeps the rejected answer's medias; callers close the Conn.
+	return c.pc.SetRemoteDescription(desc)
 }
 
 // fakeFormatsInAnswer - fix pion bug with remote SDP parsing:

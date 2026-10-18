@@ -157,6 +157,14 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 		return nil, err
 	}
 
+	// Don't publish the Conn until its video codec is final: OnTrack narrows
+	// media.Codecs and appends sprop-parameter-sets to FmtpLine, and consumers read
+	// both without a lock once Dial returns. This fails only if the connection closed.
+	if err = conn.WaitNestVideo(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
 	return &WebRTCClient{conn: conn, api: nestAPI}, nil
 }
 
