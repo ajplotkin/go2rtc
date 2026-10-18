@@ -40,6 +40,19 @@ func TestNestGate_NoSpropStillPublishes(t *testing.T) {
 	require.False(t, strings.Contains(readVideoFmtp(conn, 100*time.Millisecond), "sprop-parameter-sets="))
 }
 
+// A video codec whose answer already carries sprop-parameter-sets has nothing to
+// capture, so the gate must not sit out NestSpropTimeout waiting for SPS/PPS.
+func TestNestGate_SpropInAnswerDoesNotWait(t *testing.T) {
+	withNestTimeouts(t, 5*time.Second, 10*time.Second)
+	conn, _ := dialFakeCamera(t, "nest/webrtc", camOpts{spropAfter: -1,
+		answerFmtp: "sprop-parameter-sets=Z0LgH4yNQFAe0A==,aM48gA=="})
+
+	start := time.Now()
+	require.NoError(t, conn.WaitNestVideo())
+	require.Less(t, time.Since(start), 5*time.Second, "waited for SPS/PPS the answer already had")
+	require.Equal(t, 1, strings.Count(videoMedia(t, conn).Codecs[0].FmtpLine, "sprop-parameter-sets="))
+}
+
 // No video at all is not a dial failure: the Conn is returned once NestVideoTimeout
 // passes, and the connect watchdog and reconnect loop deal with it as they always did.
 func TestNestGate_NoVideoStillPublishes(t *testing.T) {

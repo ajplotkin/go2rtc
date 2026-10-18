@@ -2,6 +2,7 @@ package webrtc
 
 import (
 	"encoding/binary"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,7 @@ type camOpts struct {
 	spropAfter time.Duration // send SPS/PPS only this long after connecting (-1: never)
 	audioAfter time.Duration // start audio only this long after connecting
 	videoAfter time.Duration // start video only this long after connecting
+	answerFmtp string        // appended to every H264 fmtp line of the camera's answer
 }
 
 // dialFakeCamera connects a go2rtc Conn (as an active producer, the way
@@ -93,7 +95,29 @@ func dialFakeCamera(t *testing.T, formatName string, opts camOpts) (*Conn, *fake
 	cam.done.Add(1)
 	go cam.send()
 
-	require.NoError(t, conn.SetAnswer(cam.pc.LocalDescription().SDP))
+	answerSDP := cam.pc.LocalDescription().SDP
+	if opts.answerFmtp != "" {
+		// pion's answer echoes the offer's fmtp, so a camera that puts more in its
+		// answer, as a camera could, is simulated by editing the SDP.
+		var h264 []string
+		for _, line := range strings.Split(answerSDP, "\r\n") {
+			var pt int
+			if _, err := fmt.Sscanf(line, "a=rtpmap:%d H264/", &pt); err == nil {
+				h264 = append(h264, fmt.Sprintf("a=fmtp:%d ", pt))
+			}
+		}
+		lines := strings.Split(answerSDP, "\r\n")
+		for i, line := range lines {
+			for _, prefix := range h264 {
+				if strings.HasPrefix(line, prefix) {
+					lines[i] = line + ";" + opts.answerFmtp
+				}
+			}
+		}
+		answerSDP = strings.Join(lines, "\r\n")
+		require.Contains(t, answerSDP, opts.answerFmtp)
+	}
+	require.NoError(t, conn.SetAnswer(answerSDP))
 
 	t.Cleanup(func() {
 		close(cam.stop)
