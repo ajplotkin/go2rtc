@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -46,20 +47,46 @@ type DeviceInfo struct {
 var cache = map[string]*API{}
 var cacheMu sync.Mutex
 
+// Endpoints, variables so tests can point them at a local server.
+var (
+	tokenURL = "https://www.googleapis.com/oauth2/v4/token"
+	sdmURL   = "https://smartdevicemanagement.googleapis.com/v1/enterprises/"
+)
+
+// Backoff before retrying GenerateWebRtcStream after a 409 or 429; doubles each retry.
+var busyRetryDelay = time.Second * 30
+
+// A cached token this close to its expiry is not handed out: the caller could
+// not finish a request with it. The extend loop refreshes within the same margin.
+const tokenExpiryMargin = 30 * time.Second
+
 func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
 
 	key := clientID + ":" + clientSecret + ":" + refreshToken
-	now := time.Now()
 
 	// The cache only stores the OAuth token. Each caller gets its own API
 	// instance, because the Stream* fields hold per-stream session state -
 	// multiple cameras sharing one instance overwrite each other's session
 	// and only the last one gets extended.
-	if api := cache[key]; api != nil && now.Before(api.ExpiresAt) {
+	if api := cache[key]; api != nil && time.Now().Add(tokenExpiryMargin).Before(api.ExpiresAt) {
 		return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
 	}
+
+	api, err := fetchToken(clientID, clientSecret, refreshToken)
+	if err != nil {
+		return nil, err
+	}
+
+	cache[key] = api
+
+	return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
+}
+
+// fetchToken requests a new access token from Google. The caller holds cacheMu.
+func fetchToken(clientID, clientSecret, refreshToken string) (*API, error) {
+	now := time.Now()
 
 	data := url.Values{
 		"grant_type":    []string{"refresh_token"},
@@ -69,7 +96,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	}
 
 	client := &http.Client{Timeout: time.Second * 10}
-	res, err := client.PostForm("https://www.googleapis.com/oauth2/v4/token", data)
+	res, err := client.PostForm(tokenURL, data)
 	if err != nil {
 		return nil, err
 	}
@@ -90,27 +117,53 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 		return nil, err
 	}
 
-	api := &API{
-		Token:     resv.AccessToken,
-		ExpiresAt: now.Add(resv.ExpiresIn * time.Second),
+	if resv.AccessToken == "" {
+		return nil, errors.New("nest: no access token in response")
 	}
 
-	cache[key] = api
+	return &API{
+		Token:     resv.AccessToken,
+		ExpiresAt: now.Add(resv.ExpiresIn * time.Second),
+	}, nil
+}
 
-	return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
+// do sends a request to the SDM API. A 401 means Google no longer accepts the
+// token, even if its clock expiry is still ahead (Google can revoke a token
+// early), so get another one and send the request once more.
+func (a *API) do(method, uri string, body []byte) (*http.Response, error) {
+	client := &http.Client{Timeout: time.Second * 10}
+
+	for attempt := 0; ; attempt++ {
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, err := http.NewRequest(method, uri, reader)
+		if err != nil {
+			return nil, err
+		}
+
+		token := a.Token
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		res, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		if res.StatusCode != http.StatusUnauthorized || attempt > 0 {
+			return res, nil
+		}
+		res.Body.Close()
+
+		if err = a.replaceToken(token); err != nil {
+			return nil, err
+		}
+	}
 }
 
 func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" + projectID + "/devices"
-	req, err := http.NewRequest("GET", uri, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.Token)
-
-	client := &http.Client{Timeout: time.Second * 10}
-	res, err := client.Do(req)
+	res, err := a.do("GET", sdmURL+projectID+"/devices", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -172,34 +225,23 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 		return "", err
 	}
 
-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
-		projectID + "/devices/" + deviceID + ":executeCommand"
+	uri := sdmURL + projectID + "/devices/" + deviceID + ":executeCommand"
 
 	maxRetries := 3
-	retryDelay := time.Second * 30
+	retryDelay := busyRetryDelay
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+		// a.do already replaced the token and retried on a 401
+		res, err := a.do("POST", uri, b)
 		if err != nil {
 			return "", err
 		}
 
-		req.Header.Set("Authorization", "Bearer "+a.Token)
-
-		client := &http.Client{Timeout: time.Second * 10}
-		res, err := client.Do(req)
-		if err != nil {
-			return "", err
-		}
-
-		// Handle 409 (Conflict), 429 (Too Many Requests), and 401 (Unauthorized)
-		if res.StatusCode == 409 || res.StatusCode == 429 || res.StatusCode == 401 {
+		// Handle 409 (Conflict) and 429 (Too Many Requests). A new token
+		// would not help with either, so only back off.
+		if res.StatusCode == 409 || res.StatusCode == 429 {
 			res.Body.Close()
 			if attempt < maxRetries-1 {
-				// Get new token from Google
-				if err := a.refreshToken(); err != nil {
-					return "", err
-				}
 				time.Sleep(retryDelay)
 				retryDelay *= 2 // exponential backoff
 				continue
@@ -235,17 +277,27 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 	return "", errors.New("nest: max retries exceeded")
 }
 
-func (a *API) refreshToken() error {
+// credentials parses the OAuth credentials from the cache key.
+func (a *API) credentials() (clientID, clientSecret, refreshToken string, err error) {
 	if a.key == "" {
-		return errors.New("nest: unable to find cached credentials")
+		return "", "", "", errors.New("nest: unable to find cached credentials")
 	}
 
-	// Parse credentials from the cache key
 	parts := strings.SplitN(a.key, ":", 3)
 	if len(parts) != 3 {
-		return errors.New("nest: invalid cache key format")
+		return "", "", "", errors.New("nest: invalid cache key format")
 	}
-	clientID, clientSecret, refreshToken := parts[0], parts[1], parts[2]
+	return parts[0], parts[1], parts[2], nil
+}
+
+// refreshToken renews a token that is about to expire. It goes through the
+// cache, so it is only for the clock-based refresh: after a 401 the cached
+// token can be the rejected one, see replaceToken.
+func (a *API) refreshToken() error {
+	clientID, clientSecret, refreshToken, err := a.credentials()
+	if err != nil {
+		return err
+	}
 
 	// Get new API instance which will refresh the token
 	newAPI, err := NewAPI(clientID, clientSecret, refreshToken)
@@ -256,6 +308,46 @@ func (a *API) refreshToken() error {
 	// Update current API with new token
 	a.Token = newAPI.Token
 	a.ExpiresAt = newAPI.ExpiresAt
+	return nil
+}
+
+// replaceToken gets a new token after Google rejected the token failed with a
+// 401. The cache cannot be trusted here: it may still hold failed within its
+// clock expiry, and every camera on the account shares that entry. So unless
+// another camera has already replaced it, request a new token and store it for
+// all of them. cacheMu is held across the request, so cameras that get a 401
+// at the same moment make one token request between them.
+func (a *API) replaceToken(failed string) error {
+	clientID, clientSecret, refreshToken, err := a.credentials()
+	if err != nil {
+		return err
+	}
+
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+
+	if api := cache[a.key]; api != nil && api.Token != failed &&
+		time.Now().Add(tokenExpiryMargin).Before(api.ExpiresAt) {
+		a.Token = api.Token
+		a.ExpiresAt = api.ExpiresAt
+		return nil
+	}
+
+	// Drop the rejected token first, so that if the request fails the next
+	// NewAPI asks Google again instead of handing it out.
+	if api := cache[a.key]; api != nil && api.Token == failed {
+		delete(cache, a.key)
+	}
+
+	api, err := fetchToken(clientID, clientSecret, refreshToken)
+	if err != nil {
+		return err
+	}
+
+	cache[a.key] = api
+
+	a.Token = api.Token
+	a.ExpiresAt = api.ExpiresAt
 	return nil
 }
 
@@ -283,17 +375,8 @@ func (a *API) ExtendStream() error {
 		return err
 	}
 
-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
-		a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
-	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.Token)
-
-	client := &http.Client{Timeout: time.Second * 10}
-	res, err := client.Do(req)
+	uri := sdmURL + a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
+	res, err := a.do("POST", uri, b)
 	if err != nil {
 		return err
 	}
@@ -336,20 +419,12 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
 		return "", err
 	}
 
-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
-		projectID + "/devices/" + deviceID + ":executeCommand"
-	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+	uri := sdmURL + projectID + "/devices/" + deviceID + ":executeCommand"
+	res, err := a.do("POST", uri, b)
 	if err != nil {
 		return "", err
 	}
-
-	req.Header.Set("Authorization", "Bearer "+a.Token)
-
-	client := &http.Client{Timeout: time.Second * 10}
-	res, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
+	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
 		return "", errors.New("nest: wrong status: " + res.Status)
@@ -400,17 +475,8 @@ func (a *API) StopRTSPStream() error {
 		return err
 	}
 
-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
-		a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
-	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.Token)
-
-	client := &http.Client{Timeout: time.Second * 10}
-	res, err := client.Do(req)
+	uri := sdmURL + a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
+	res, err := a.do("POST", uri, b)
 	if err != nil {
 		return err
 	}
@@ -487,7 +553,7 @@ func (a *API) StartExtendStreamTimer() {
 			select {
 			case <-timer.C:
 				// The OAuth token lives ~1 hour, sessions can live longer
-				if time.Now().After(a.ExpiresAt.Add(-30 * time.Second)) {
+				if time.Now().After(a.ExpiresAt.Add(-tokenExpiryMargin)) {
 					if err := a.refreshToken(); err != nil {
 						if fails++; fails <= 3 {
 							timer.Reset(15 * time.Second)
