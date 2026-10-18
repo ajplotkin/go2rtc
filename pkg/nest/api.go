@@ -56,8 +56,8 @@ var (
 // Backoff before retrying GenerateWebRtcStream after a 409 or 429; doubles each retry.
 var busyRetryDelay = time.Second * 30
 
-// A cached token this close to its expiry is not handed out: the caller could
-// not finish a request with it. The extend loop refreshes within the same margin.
+// A cached token this close to its expiry is not handed out: it might expire
+// before the caller's request reaches Google. The extend loop refreshes within the same margin.
 const tokenExpiryMargin = 30 * time.Second
 
 func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
@@ -311,8 +311,8 @@ func (a *API) refreshToken() error {
 	return nil
 }
 
-// replaceToken gets a new token after Google rejected the token failed with a
-// 401. The cache cannot be trusted here: it may still hold failed within its
+// replaceToken gets a new token after Google rejected the token `failed` with a
+// 401. The cache cannot be trusted here: it may still hold `failed` within its
 // clock expiry, and every camera on the account shares that entry. So unless
 // another camera has already replaced it, request a new token and store it for
 // all of them. cacheMu is held across the request, so cameras that get a 401
@@ -595,7 +595,9 @@ func (a *API) StopExtendStreamTimer() {
 	}
 	// Wait for the goroutine to actually exit before returning, so a caller (RTSPClient.Stop)
 	// can't race an in-flight ExtendStream writing StreamToken/StreamExtensionToken against
-	// StopRTSPStream clearing them. Bounded by the 10s HTTP client timeout.
+	// StopRTSPStream clearing them. Bounded by a few 10s HTTP timeouts: the extend
+	// request, a token request before it and, after a 401, a token request and the
+	// retry, each token request possibly queued behind other cameras' on cacheMu.
 	if a.extendDone != nil {
 		<-a.extendDone
 		a.extendDone = nil

@@ -3,6 +3,7 @@ package nest
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,6 +24,7 @@ type fakeGoogle struct {
 	tokenRequests atomic.Int32
 	tokenFail     atomic.Bool  // the token endpoint answers 500
 	expiresIn     atomic.Int32 // seconds, 0 means 3600
+	newConns      atomic.Int32 // TCP connections the server accepted
 
 	mu       sync.Mutex
 	revoked  map[string]bool
@@ -35,10 +38,11 @@ func newFakeGoogle(t *testing.T) *fakeGoogle {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		// assert, not require: this runs on a server goroutine, where FailNow must not be called
 		n := g.tokenRequests.Add(1)
-		require.NoError(t, r.ParseForm())
-		require.Equal(t, "refresh_token", r.PostForm.Get("grant_type"))
-		require.Equal(t, "refresh", r.PostForm.Get("refresh_token"))
+		assert.NoError(t, r.ParseForm())
+		assert.Equal(t, "refresh_token", r.PostForm.Get("grant_type"))
+		assert.Equal(t, "refresh", r.PostForm.Get("refresh_token"))
 		if g.tokenFail.Load() {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -60,7 +64,7 @@ func newFakeGoogle(t *testing.T) *fakeGoogle {
 		g.bearers = append(g.bearers, bearer)
 		revoked := g.revoked[bearer]
 		status := 0
-		if len(g.status) > 0 {
+		if len(g.status) > 0 && !revoked { // a 401 does not use up a queued status
 			status, g.status = g.status[0], g.status[1:]
 		}
 		on401 := g.onSDM401
@@ -70,7 +74,10 @@ func newFakeGoogle(t *testing.T) *fakeGoogle {
 			if on401 != nil {
 				on401()
 			}
+			// Google's 401 has a JSON error body
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}`))
 			return
 		}
 		if status != 0 {
@@ -87,7 +94,13 @@ func newFakeGoogle(t *testing.T) *fakeGoogle {
 		})
 	})
 
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			g.newConns.Add(1)
+		}
+	}
+	srv.Start()
 	t.Cleanup(srv.Close)
 
 	oldToken, oldSDM, oldDelay := tokenURL, sdmURL, busyRetryDelay
@@ -226,6 +239,33 @@ func TestStale401AdoptsCachedToken(t *testing.T) {
 	require.Equal(t, int32(2), g.tokenRequests.Load())
 }
 
+// The retry after a 401 happens inside the request and does not use up one of
+// ExchangeSDP's three attempts: 401, then 409, 409, then success, still succeeds.
+func Test401RetryUsesNoAttempt(t *testing.T) {
+	g := newFakeGoogle(t)
+	api := newTestAPI(t)
+	g.revoke("tok1")
+	g.setStatus(http.StatusConflict, http.StatusConflict)
+
+	answer, err := api.ExchangeSDP("project", "device", "offer")
+	require.NoError(t, err)
+	require.Equal(t, "answer", answer)
+	require.Equal(t, []string{"tok1", "tok2", "tok2", "tok2"}, g.sdmBearers())
+}
+
+// The 401 response is closed before the retry, so the token request and the
+// retry reuse the one keep-alive connection.
+func Test401BodyIsClosed(t *testing.T) {
+	g := newFakeGoogle(t)
+	api := newTestAPI(t)
+	g.revoke("tok1")
+
+	_, err := api.ExchangeSDP("project", "device", "offer")
+	require.NoError(t, err)
+	require.Equal(t, []string{"tok1", "tok2"}, g.sdmBearers())
+	require.Equal(t, int32(1), g.newConns.Load())
+}
+
 // A 409 or 429 is not a token problem: back off and retry with the same
 // token, and make no token request.
 func TestBusyMakesNoTokenRequest(t *testing.T) {
@@ -334,4 +374,70 @@ func TestEmptyAccessTokenIsAnError(t *testing.T) {
 
 	_, err := NewAPI("client", "secret", "refresh")
 	require.Error(t, err)
+}
+
+// The 401 retry does not sleep the busy backoff. busyRetryDelay is set to an
+// hour so any sleep on the 401 path would hang the test instead of passing
+// under the 10ms value newFakeGoogle installs.
+func TestExchangeSDP401DoesNotBackOff(t *testing.T) {
+	g := newFakeGoogle(t)
+	busyRetryDelay = time.Hour
+	api := newTestAPI(t)
+	g.revoke("tok1")
+	start := time.Now()
+	_, err := api.ExchangeSDP("project", "device", "offer")
+	require.NoError(t, err)
+	require.Less(t, time.Since(start), 5*time.Second)
+	require.Equal(t, "tok2", api.Token)
+}
+
+// replaceToken updates ExpiresAt too (the extend loop keys its clock refresh
+// off it).
+func TestReplaceTokenUpdatesExpiry(t *testing.T) {
+	g := newFakeGoogle(t)
+	api := newTestAPI(t)
+	g.expiresIn.Store(7200)
+	g.revoke("tok1")
+	_, err := api.ExchangeSDP("project", "device", "offer")
+	require.NoError(t, err)
+	cacheMu.Lock()
+	exp := cache[api.key].ExpiresAt
+	cacheMu.Unlock()
+	require.Equal(t, exp, api.ExpiresAt)
+	require.Greater(t, api.ExpiresAt, time.Now().Add(90*time.Minute))
+}
+
+// A cached token that differs from the rejected one but is itself about to
+// expire is not adopted; a new one is requested.
+func TestStale401DoesNotAdoptNearlyExpiredToken(t *testing.T) {
+	g := newFakeGoogle(t)
+	first := newTestAPI(t)
+	second := newTestAPI(t) // both tok1
+	g.revoke("tok1")
+	g.expiresIn.Store(20)
+	_, err := second.ExchangeSDP("project", "device2", "offer") // replaces with tok2, 20s left
+	require.NoError(t, err)
+	require.Equal(t, "tok2", cachedToken(t))
+	g.expiresIn.Store(0)
+
+	_, err = first.ExchangeSDP("project", "device1", "offer")
+	require.NoError(t, err)
+	require.Equal(t, "tok3", first.Token)
+	require.Equal(t, int32(3), g.tokenRequests.Load())
+}
+
+// The extend loop refreshes the token by clock before extending.
+func TestExtendLoopRefreshesNearExpiry(t *testing.T) {
+	g := newFakeGoogle(t)
+	g.expiresIn.Store(20) // tok1 is inside the margin from the start
+	api := newTestAPI(t)
+	g.expiresIn.Store(0)
+	_, err := api.ExchangeSDP("project", "device", "offer")
+	require.NoError(t, err)
+	api.StreamExpiresAt = time.Now() // timer fires at once
+	api.StartExtendStreamTimer()
+	require.Eventually(t, func() bool { return len(g.sdmBearers()) >= 2 }, 5*time.Second, 10*time.Millisecond)
+	api.StopExtendStreamTimer()
+	require.Equal(t, "tok2", api.Token)
+	require.Equal(t, []string{"tok1", "tok2"}, g.sdmBearers()[:2])
 }
