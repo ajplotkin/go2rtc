@@ -154,6 +154,10 @@ func (a *API) do(method, uri string, body []byte) (*http.Response, error) {
 		if res.StatusCode != http.StatusUnauthorized || attempt > 0 {
 			return res, nil
 		}
+		// Read to the end before closing, so the connection goes back to the pool
+		// before the token request needs one. Go before 1.27 drops a connection
+		// whose body is closed unread.
+		_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
 		res.Body.Close()
 
 		if err = a.replaceToken(token); err != nil {

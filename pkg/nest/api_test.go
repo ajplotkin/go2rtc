@@ -3,7 +3,7 @@ package nest
 import (
 	"encoding/json"
 	"fmt"
-	"net"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,7 +24,6 @@ type fakeGoogle struct {
 	tokenRequests atomic.Int32
 	tokenFail     atomic.Bool  // the token endpoint answers 500
 	expiresIn     atomic.Int32 // seconds, 0 means 3600
-	newConns      atomic.Int32 // TCP connections the server accepted
 
 	mu       sync.Mutex
 	revoked  map[string]bool
@@ -94,13 +93,7 @@ func newFakeGoogle(t *testing.T) *fakeGoogle {
 		})
 	})
 
-	srv := httptest.NewUnstartedServer(mux)
-	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
-		if state == http.StateNew {
-			g.newConns.Add(1)
-		}
-	}
-	srv.Start()
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
 	oldToken, oldSDM, oldDelay := tokenURL, sdmURL, busyRetryDelay
@@ -253,17 +246,72 @@ func Test401RetryUsesNoAttempt(t *testing.T) {
 	require.Equal(t, []string{"tok1", "tok2", "tok2", "tok2"}, g.sdmBearers())
 }
 
-// The 401 response is closed before the retry, so the token request and the
-// retry reuse the one keep-alive connection.
+// The 401 response is read to the end and closed before the token request, so
+// the connection goes back to the pool and the token request can reuse it. Go
+// before 1.27 drops a connection whose body is closed unread; 1.27 drains it,
+// but only after Close returns. So check the body itself, not the connections.
 func Test401BodyIsClosed(t *testing.T) {
 	g := newFakeGoogle(t)
 	api := newTestAPI(t)
 	g.revoke("tok1")
 
+	rt := &bodyRecorder{base: http.DefaultTransport}
+	http.DefaultTransport = rt
+	t.Cleanup(func() { http.DefaultTransport = rt.base })
+
 	_, err := api.ExchangeSDP("project", "device", "offer")
 	require.NoError(t, err)
-	require.Equal(t, []string{"tok1", "tok2"}, g.sdmBearers())
-	require.Equal(t, int32(1), g.newConns.Load())
+	require.Equal(t, []string{"/sdm/ 401", "/token 200", "/sdm/ 200"}, rt.log)
+	// As the token request was sent:
+	require.True(t, rt.eof, "401 body not read to EOF")
+	require.True(t, rt.closed, "401 body not closed")
+}
+
+// bodyRecorder logs each request's path and status, and records whether the
+// last 401's body had been read to EOF and closed when the next request went out.
+type bodyRecorder struct {
+	base        http.RoundTripper
+	log         []string
+	last401     *recordedBody
+	eof, closed bool
+}
+
+func (r *bodyRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	if b := r.last401; b != nil {
+		r.eof, r.closed, r.last401 = b.eof, b.closed, nil
+	}
+	res, err := r.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	path := req.URL.Path
+	if strings.HasPrefix(path, "/sdm/") {
+		path = "/sdm/"
+	}
+	r.log = append(r.log, fmt.Sprintf("%s %d", path, res.StatusCode))
+	if res.StatusCode == http.StatusUnauthorized {
+		r.last401 = &recordedBody{ReadCloser: res.Body}
+		res.Body = r.last401
+	}
+	return res, nil
+}
+
+type recordedBody struct {
+	io.ReadCloser
+	eof, closed bool
+}
+
+func (b *recordedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		b.eof = true
+	}
+	return n, err
+}
+
+func (b *recordedBody) Close() error {
+	b.closed = true
+	return b.ReadCloser.Close()
 }
 
 // A 409 or 429 is not a token problem: back off and retry with the same
