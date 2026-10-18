@@ -421,3 +421,33 @@ func TestNestRTPPacketsToWriteSkipsPaddingWhenHealthy(t *testing.T) {
 
 	require.Equal(t, []uint16{1, 3}, nestPacketSeqs(w.packets))
 }
+
+func TestNestRTPReorderReanchorResetsBehindStreak(t *testing.T) {
+	var r nestRTPReorder
+	now := time.Unix(0, 0)
+
+	r.push(nestTestPacket(40000), now)
+
+	seq := uint16(39000)
+
+	// Backward reset: behind the old head in signed 16-bit terms.
+	var res nestRTPReorderResult
+
+	for i := 0; i < nestRTPReorderMaxPending; i++ {
+		res = r.push(nestTestPacket(seq), now)
+		seq++
+	}
+
+	require.True(t, res.reanchored)
+
+	// A stray packet behind the new head must not re-anchor again.
+	res = r.push(nestTestPacket(38000), now)
+
+	require.False(t, res.reanchored)
+	require.Empty(t, res.packets)
+
+	// In-order forwarding must continue normally.
+	res = r.push(nestTestPacket(seq), now)
+
+	require.Equal(t, []uint16{seq}, nestPacketSeqs(res.packets))
+}
