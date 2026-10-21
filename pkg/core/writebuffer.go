@@ -84,9 +84,8 @@ func (w *WriteBuffer) Close() error {
 	// long-running panic reports upstream (#338, #1220, #1261, #1757); this mirrors
 	// upstream PR #2339 (Color-Kat).
 	//
-	// Worth stating plainly: a panic here takes down the go2rtc process, i.e. every
-	// camera at once. On this deployment that is a whole-stack outage, not one dropped
-	// consumer.
+	// A panic here takes down the go2rtc process, i.e. every camera at once. On this
+	// deployment that is a whole-stack outage, not one dropped consumer.
 	if w.err == nil {
 		w.err = io.ErrClosedPipe
 	}
