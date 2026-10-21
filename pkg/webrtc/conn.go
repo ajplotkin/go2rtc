@@ -13,6 +13,7 @@ import (
 	"github.com/AlexxIT/go2rtc/pkg/h264"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 	zlog "github.com/rs/zerolog/log"
 )
@@ -149,6 +150,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// Declared out here so the read-loop exit paths below can name the session in their logs.
 		var connID int64
 		var badRTP int
+		var nestReorder nestRTPReorder
+		var nestWaitPartitionHead bool
+		var nestPartitionHead codecs.H264Packet
 		if isNestVideoTrack {
 			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 		}
@@ -361,21 +365,14 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 				return
 			}
 
-			if len(packet.Payload) == 0 {
-				// WebRTC padding / bandwidth-probe packet: not real media. Must NOT refresh
-				// lastVideoNS, or a camera that keeps probing through a drought would keep the
-				// "no video RTP" watchdog from ever firing.
-				continue
-			}
-
-			if isNestVideo {
+			if len(packet.Payload) != 0 && isNestVideo {
 				lastVideoNS.Store(int64(time.Since(nestEpoch)))
 				if isRTPKeyframe(packet.Payload) {
 					lastIDRNS.Store(int64(time.Since(nestEpoch)))
 				}
 			}
 
-			if captureSprop {
+			if len(packet.Payload) != 0 && captureSprop {
 				save := func(nal []byte) {
 					if len(nal) == 0 {
 						return
@@ -409,6 +406,49 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 						base64.StdEncoding.EncodeToString(spropPPS)
 					captureSprop = false
 				}
+			}
+
+			if isNestVideo {
+				result := nestReorder.push(packet, time.Now())
+
+				if result.reanchored {
+					zlog.Warn().
+						Int64("conn", connID).
+						Uint16("old_head", result.oldHead).
+						Uint16("new_seq", result.newSeq).
+						Msg("nest: RTP sequence re-anchored")
+				}
+
+				if result.gapExpired {
+					zlog.Warn().
+						Int64("conn", connID).
+						Int("missing", int(result.missing)).
+						Msg("nest: RTP reorder gap abandoned, waiting for partition head")
+				}
+
+				write := nestRTPPacketsToWrite(
+					result,
+					nestWaitPartitionHead,
+					&nestPartitionHead,
+				)
+				nestWaitPartitionHead = write.waitPartitionHead
+
+				if write.recovered {
+					zlog.Debug().
+						Int64("conn", connID).
+						Uint16("seq", write.recoveredSeq).
+						Msg("nest: RTP recovered at partition head")
+				}
+
+				for _, ordered := range write.packets {
+					track.WriteRTP(ordered)
+				}
+				continue
+			}
+
+			// Preserve the existing behaviour for every non-Nest-H264 track.
+			if len(packet.Payload) == 0 {
+				continue
 			}
 
 			track.WriteRTP(packet)
