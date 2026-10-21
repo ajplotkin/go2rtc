@@ -4,8 +4,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,7 +34,42 @@ type Conn struct {
 
 	offer  string
 	closed core.Waiter
+
+	// tracksMu guards Receivers. OnTrack runs one goroutine per remote track, and each
+	// calls GetTrack, while the streams layer calls GetTrack and Stop from its own.
+	tracksMu sync.Mutex
+
+	// recv counts bytes from every track's read loop; MarshalJSON reports it as Recv.
+	recv atomic.Int64
+
+	// Nest dial gate, see WaitNestVideo.
+	nestMu        sync.Mutex
+	nestPublished bool          // set by WaitNestVideo; after it OnTrack writes no FmtpLine or media.Codecs
+	nestVideo     chan struct{} // closed once the video track's receiver exists (and pre-publication, media.Codecs is narrowed)
+	nestSpropDone chan struct{} // closed once sprop-parameter-sets is written, or can't be
+	nestDead      chan struct{} // closed by Close
+	nestVideoOnce sync.Once
+	nestSpropOnce sync.Once
+	nestDeadOnce  sync.Once
 }
+
+// Bounds for WaitNestVideo. NestVideoTimeout is how long a dial waits for the first video
+// packet; NestSpropTimeout is how long it then waits for SPS/PPS. Past either, the Conn
+// is returned without what's missing, never failed: no video by then is left to the
+// connect watchdog (30s from Connected) and the producer's reconnect loop, as before
+// the gate existed. Both waits run under the streams producer's lock, and the stream's
+// lock waits on that one in stopProducers, mainly while a reconnect dials, so they're
+// kept short. They also move time from after a consumer attaches to before: an RTSP
+// client that triggers a cold dial, or sends DESCRIBE during a reconnect, gets its reply
+// up to NestVideoTimeout+NestSpropTimeout later than before. The session's opening
+// keyframe has then already passed, so its first decodable frame can also come up to
+// one PLI interval (2s) later, against the probe time sprop saves the client. Normally
+// the wait is ICE plus the first packet. NestSpropTimeout leaves room for the PLI
+// ticker's first request, sent 2s into the track, and the keyframe it asks for.
+var (
+	NestVideoTimeout = 10 * time.Second
+	NestSpropTimeout = 4 * time.Second
+)
 
 func NewConn(pc *webrtc.PeerConnection) *Conn {
 	c := &Conn{
@@ -42,6 +79,10 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			Transport:  pc,
 		},
 		pc: pc,
+
+		nestVideo:     make(chan struct{}),
+		nestSpropDone: make(chan struct{}),
+		nestDead:      make(chan struct{}),
 	}
 
 	// Patched (Nest): set true once the Nest video track delivers its first RTP packet.
@@ -91,46 +132,26 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			return
 		}
 
-		// Adopt the transmitted codec into a receiver a consumer is already on, so the
-		// GetTrack below (Conn.GetTrack, pkg/webrtc/producer.go:8 -- it shadows
-		// core.Connection.GetTrack) finds it by pointer identity instead of minting a second
-		// receiver.
-		//
-		// getMediaCodec resolves `codec` from the payload type actually being transmitted, but
-		// media.Codecs is narrowed to that entry only BELOW. A consumer that wired up earlier
-		// matched the FIRST codec in the answer, which for Nest need not be the transmitted
-		// one -- so OnTrack ends up feeding a receiver with no consumers while the consumer
-		// sits on one that never receives. Observed live: receiver A childs=true bytes=0
-		// profile=<nil> beside receiver B childs=false bytes=3546841 profile=Main. Audio is
-		// unaffected (single Opus payload type), which is why it is so quiet: ffmpeg keeps
-		// reading audio so its socket timeout never fires, and frag_keyframe cannot cut a
-		// fragment without video keyframes.
-		//
-		// Deliberately not the reverse (moving senders onto the new receiver): that receiver is
-		// absent from Producer.receivers, so stopProducers would see no attached senders and
-		// stop a producer that still has live consumers.
-		//
-		// Gated to Nest to bound the blast radius here; the pointer-vs-value mismatch is
-		// generic to any producer whose answer keeps several codecs on one media.
+		var track *core.Receiver
+		var err error
 		if c.FormatName == "nest/webrtc" {
-			for _, recv := range c.Receivers {
-				if recv.Media == media && recv.Codec != codec && recv.Codec.Match(codec) {
-					recv.Codec = codec
-					break
-				}
-			}
+			track, err = c.nestGetTrack(media, codec)
+		} else {
+			track, err = c.GetTrack(media, codec)
 		}
-
-		track, err := c.GetTrack(media, codec)
 		if err != nil {
 			return
 		}
 
-		switch c.Mode {
-		case core.ModePassiveProducer, core.ModeActiveProducer:
-			// replace the theoretical list of codecs with the actual list of codecs
-			if len(media.Codecs) > 1 {
-				media.Codecs = []*core.Codec{codec}
+		// nestGetTrack does this itself (for the same modes), under the lock that orders it
+		// against publication.
+		if c.FormatName != "nest/webrtc" {
+			switch c.Mode {
+			case core.ModePassiveProducer, core.ModeActiveProducer:
+				// replace the theoretical list of codecs with the actual list of codecs
+				if len(media.Codecs) > 1 {
+					media.Codecs = []*core.Codec{codec}
+				}
 			}
 		}
 
@@ -205,16 +226,30 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// no sprop; SPS/PPS arrive in-band (usually bundled in a STAP-A). Upstream does the
 		// equivalent for H265 (pkg/dvrip). Gated on FormatName like the PLI patch above.
 		//
-		// Note (accepted race): FmtpLine is appended from this receive goroutine without a
-		// lock. In practice SPS/PPS are captured within the first few frames (the 2s PLI above
-		// forces an early keyframe), before any RTSP consumer's DESCRIBE clones the codec, so
-		// the write happens-before the read. A -race build could flag a consumer connecting
-		// during the sub-2s warm-up window; upstream's H265 append in pkg/dvrip is unguarded
-		// the same way. Codec.Match ignores FmtpLine, so this can't affect media matching.
-		// Left lock-free to mirror upstream; documented rather than hidden.
-		captureSprop := c.FormatName == "nest/webrtc" && codec.Name == core.CodecH264 &&
-			!strings.Contains(codec.FmtpLine, "sprop-parameter-sets=")
+		// The codec is shared: consumers clone it (pkg/rtsp, pkg/mp4), hand it to
+		// h264.RTPDepay, or marshal it on every /api/streams request, none of them under a
+		// lock. So FmtpLine is written only BEFORE the Conn is published: pkg/nest's dial
+		// calls WaitNestVideo, which holds the Conn back until this write is done (or gives
+		// up on it) and then sets nestPublished, after which nothing here writes the codec.
+		// An earlier version appended at any time and called it an accepted race; every
+		// reconnect reopened the window, and the two separate += could expose a half line.
+		// Read under nestMu too: a second video track pre-publication would write it.
+		var captureSprop bool
+		if c.FormatName == "nest/webrtc" && codec.Name == core.CodecH264 {
+			c.nestMu.Lock()
+			captureSprop = !c.nestPublished && !strings.Contains(codec.FmtpLine, "sprop-parameter-sets=")
+			c.nestMu.Unlock()
+		}
 		var spropSPS, spropPPS []byte
+
+		// nestGetTrack has created the receiver and, before publication, narrowed
+		// media.Codecs to its codec. Tell WaitNestVideo.
+		if isNestVideoTrack {
+			c.nestVideoOnce.Do(func() { close(c.nestVideo) })
+			if !captureSprop {
+				c.nestSpropOnce.Do(func() { close(c.nestSpropDone) })
+			}
+		}
 
 		// Patched: stall watchdog for the Nest video track. An expired/quiet Nest WebRTC session
 		// stops delivering media WITHOUT erroring the connection, so producer.go never reconnects
@@ -338,7 +373,7 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 				return
 			}
 
-			c.Recv += n
+			c.recv.Add(int64(n))
 
 			packet := &rtp.Packet{}
 			if err := packet.Unmarshal(b[:n]); err != nil {
@@ -398,12 +433,18 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 					save(pl)
 				}
 				if spropSPS != nil && spropPPS != nil {
-					if codec.FmtpLine != "" {
-						codec.FmtpLine += ";"
-					}
-					codec.FmtpLine += "sprop-parameter-sets=" +
+					sprop := "sprop-parameter-sets=" +
 						base64.StdEncoding.EncodeToString(spropSPS) + "," +
 						base64.StdEncoding.EncodeToString(spropPPS)
+					c.nestMu.Lock()
+					if !c.nestPublished {
+						if codec.FmtpLine != "" {
+							sprop = codec.FmtpLine + ";" + sprop
+						}
+						codec.FmtpLine = sprop // one write, never a half line
+					}
+					c.nestMu.Unlock()
+					c.nestSpropOnce.Do(func() { close(c.nestSpropDone) })
 					captureSprop = false
 				}
 			}
@@ -495,6 +536,79 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 	return c
 }
 
+// nestGetTrack is OnTrack's GetTrack for a Nest Conn. Until WaitNestVideo publishes
+// the Conn, it may write shared state: it narrows media.Codecs to the transmitted
+// codec (and runs the #2389 adoption loop). nestMu orders those writes before
+// publication. A track that first arrives after publication writes neither, because
+// consumers and /api/streams read both without a lock. It registers under the first
+// listed codec of the same format (name, clock rate, channels) instead. That differs
+// from the transmitted codec only when the m-line lists the format more than once,
+// as Nest's video does with several H264 payload types: a video track that misses
+// NestVideoTimeout lands here. MatchMedia hands that same first entry to a consumer
+// whose own codec list contains the format, unless an earlier producer codec matches
+// the consumer first; such a consumer stays on a receiver this track never feeds,
+// exactly as it did before the gate existed.
+func (c *Conn) nestGetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
+	c.nestMu.Lock()
+	defer c.nestMu.Unlock()
+
+	if c.nestPublished {
+		if listed := media.MatchCodec(codec); listed != nil {
+			codec = listed
+		}
+		return c.GetTrack(media, codec)
+	}
+
+	// Adopt the transmitted codec into a receiver a consumer is already on, so the
+	// GetTrack below (Conn.GetTrack, pkg/webrtc/producer.go:8 -- it shadows
+	// core.Connection.GetTrack) finds it by pointer identity instead of minting a second
+	// receiver.
+	//
+	// getMediaCodec resolves `codec` from the payload type actually being transmitted, but
+	// media.Codecs is narrowed to that entry only BELOW. A consumer that wired up earlier
+	// matched the FIRST codec in the answer, which for Nest need not be the transmitted
+	// one -- so OnTrack ends up feeding a receiver with no consumers while the consumer
+	// sits on one that never receives. Observed live: receiver A childs=true bytes=0
+	// profile=<nil> beside receiver B childs=false bytes=3546841 profile=Main. Audio is
+	// unaffected (single Opus payload type), which is why it is so quiet: ffmpeg keeps
+	// reading audio so its socket timeout never fires, and frag_keyframe cannot cut a
+	// fragment without video keyframes.
+	//
+	// Deliberately not the reverse (moving senders onto the new receiver): that receiver is
+	// absent from Producer.receivers, so stopProducers would see no attached senders and
+	// stop a producer that still has live consumers.
+	//
+	// Gated to Nest to bound the blast radius here; the pointer-vs-value mismatch is
+	// generic to any producer whose answer keeps several codecs on one media.
+	//
+	// For Nest this loop can no longer match: before publication no consumer can reach the
+	// Conn (Dial hasn't returned, and on reconnect p.conn is still the old one), so every
+	// receiver here belongs to another track's media. It is kept as a guard for #2389 in
+	// case that ever changes.
+	c.tracksMu.Lock()
+	for _, recv := range c.Receivers {
+		if recv.Media == media && recv.Codec != codec && recv.Codec.Match(codec) {
+			recv.Codec = codec
+			break
+		}
+	}
+	c.tracksMu.Unlock()
+
+	track, err := c.GetTrack(media, codec)
+	if err != nil {
+		return nil, err
+	}
+
+	switch c.Mode {
+	case core.ModePassiveProducer, core.ModeActiveProducer:
+		// replace the theoretical list of codecs with the actual list of codecs
+		if len(media.Codecs) > 1 {
+			media.Codecs = []*core.Codec{codec}
+		}
+	}
+	return track, nil
+}
+
 // isRTPKeyframe reports whether an RTP H264 payload begins or contains an IDR NAL.
 // Handles single NAL (type 5), STAP-A (24, bundled), and FU-A (28) start fragments.
 // h264.IsKeyframe expects AVCC (length-prefixed), not RTP payloads, so detect here.
@@ -524,12 +638,66 @@ func isRTPKeyframe(pl []byte) bool {
 }
 
 func (c *Conn) MarshalJSON() ([]byte, error) {
-	return json.Marshal(c.Connection)
+	c.tracksMu.Lock()
+	conn := c.Connection
+	c.tracksMu.Unlock()
+	conn.Recv = c.bytesRecv()
+	return json.Marshal(conn)
+}
+
+func (c *Conn) bytesRecv() int {
+	return int(c.recv.Load())
 }
 
 func (c *Conn) Close() error {
+	c.nestDeadOnce.Do(func() { close(c.nestDead) })
 	c.closed.Done(nil)
 	return c.pc.Close()
+}
+
+// WaitNestVideo holds a Nest dial until OnTrack has finished writing the video track's
+// shared state, so the Conn can be handed to the streams layer with no writer left on
+// it. For that track OnTrack narrows media.Codecs to the codec actually transmitted
+// (an answer can list several) and appends sprop-parameter-sets to its FmtpLine, and
+// consumers and /api/streams read both without a lock once Dial returns.
+//
+// It waits up to NestVideoTimeout for the video track and then up to NestSpropTimeout
+// for SPS/PPS, and returns without whichever didn't arrive. It fails only if the
+// connection closes first; the caller should then close the Conn. Either way it marks
+// the Conn published, and from then on OnTrack writes neither FmtpLine nor
+// media.Codecs (see nestGetTrack), so a track that arrives late needs no wait. The cost
+// lasts for the session: one whose video or SPS/PPS missed the window never gets
+// sprop-parameter-sets, and a late track's media stays un-narrowed, until a re-dial.
+func (c *Conn) WaitNestVideo() error {
+	defer func() {
+		c.nestMu.Lock()
+		c.nestPublished = true
+		c.nestMu.Unlock()
+	}()
+
+	timer := time.NewTimer(NestVideoTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-c.nestVideo:
+	case <-c.nestDead:
+		return errors.New("webrtc: connection closed before video arrived")
+	case <-timer.C:
+		select {
+		case <-c.nestVideo: // arrived as the timer fired
+		default:
+			return nil
+		}
+	}
+
+	timer.Reset(NestSpropTimeout)
+	select {
+	case <-c.nestSpropDone:
+	case <-c.nestDead:
+		return errors.New("webrtc: connection closed while waiting for SPS/PPS")
+	case <-timer.C:
+	}
+	return nil
 }
 
 func (c *Conn) AddCandidate(candidate string) error {

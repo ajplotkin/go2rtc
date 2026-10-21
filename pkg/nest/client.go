@@ -96,6 +96,10 @@ func (c *WebRTCClient) MarshalJSON() ([]byte, error) {
 	return c.conn.MarshalJSON()
 }
 
+// rtcConfig is the PeerConnection configuration for WebRTC dials. A var so tests can
+// dial a loopback camera without reaching Google's STUN server.
+var rtcConfig = pion.Configuration{ICEServers: []pion.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}}
+
 func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, error) {
 	// Fix: use udp4-only to avoid ICE failure on hosts with broken/partial IPv6.
 	// Stock go2rtc uses webrtc.NewAPI() which passes nil filters, gathering on all
@@ -112,8 +116,7 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 		return nil, err
 	}
 
-	conf := pion.Configuration{ICEServers: []pion.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}}
-	pc, err := rtcAPI.NewPeerConnection(conf)
+	pc, err := rtcAPI.NewPeerConnection(rtcConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -154,6 +157,14 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 
 	if err = conn.SetAnswer(answer); err != nil {
 		_ = pc.Close()
+		return nil, err
+	}
+
+	// Don't publish the Conn until its video codec is final: OnTrack narrows
+	// media.Codecs and appends sprop-parameter-sets to FmtpLine, and consumers read
+	// both without a lock once Dial returns. This fails only if the connection closed.
+	if err = conn.WaitNestVideo(); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 
